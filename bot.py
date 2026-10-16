@@ -455,6 +455,7 @@ async def ayuda(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Toca «Revendedores» en el menú.\n\n"
         f"📲 Soporte: {PHONE}\n\n{BRAND}",
         reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("💬 Escribir a soporte", callback_data="m|soporte")],
             [InlineKeyboardButton("🟢 Ver referencias", url=LINK_REFERENCIAS)],
             [InlineKeyboardButton("⬅️ Menú", callback_data="m|menu")]]))
 
@@ -2008,7 +2009,10 @@ PEDIR = {
     "craft_comprar": ("craft_id", "🎨 Envía el Player ID de Free Fire que recibirá el pack (solo números):"),
     "canjear": ("canjear", "🎟 Envía tu código de recarga:"),
     "auto_nuevo": ("auto_id", "🤖 Envía el ID de Free Fire que recibirá los likes cada día (solo números):"),
+    "soporte": ("soporte", "💬 Escribe tu mensaje para soporte (solo texto) y lo enviamos. Te respondemos por aquí mismo."),
 }
+
+_ULT_SOPORTE = {}   # antispam: último mensaje de soporte por usuario
 
 TOGGLES = {
     "bot_on": ("🔌 Bot", "1"),
@@ -2029,6 +2033,7 @@ ADMIN_AYUDA = (
     "/resetprueba <ID|@usr> — Dar otra prueba gratis\n"
     "/autoday <días> <ID> [cantidad] — Auto con tu saldo\n"
     "/autoremove <ID> — Quitar un auto\n"
+    "/msg <ID|@usr> <mensaje> — Escribirle a un cliente por el bot\n"
     "/admin — Abrir este panel"
 )
 
@@ -2161,6 +2166,17 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ----- Likes: cantidad elegida -----
     if partes[0] == "lk" and len(partes) == 3 and partes[1].isdigit() and partes[2].isdigit():
         return await procesar_likes(ctx, uid, chat_id, partes[1], int(partes[2]))
+
+    # ----- Admin: responder a un cliente por el bot -----
+    if partes[0] == "rp" and len(partes) == 2 and partes[1].isdigit():
+        if uid not in ADMINS:
+            return
+        ctx.user_data["esperando"] = (f"resp:{partes[1]}", time.time())
+        return await say(
+            ctx, chat_id,
+            f"💬 Escribe tu respuesta para el cliente {partes[1]}.\n"
+            "Se la envío por el bot y tu cuenta no se muestra.",
+            reply_markup=InlineKeyboardMarkup([[B("❌ Cancelar", callback_data="m|cancel")]]))
 
     # ----- Craftland: continuar -----
     if partes[0] == "ct":
@@ -2303,11 +2319,13 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"Toca el botón y te contactamos, o escríbenos al {PHONE}.",
             InlineKeyboardMarkup([
                 [B("📩 Quiero ser revendedor / pedido grande", callback_data="m|rev_solicitar")],
+                [B("💬 Escribir a soporte", callback_data="m|soporte")],
                 [B("💰 Ver precios", callback_data="m|precios")],
                 volver]))
 
     if accion == "rev_solicitar":
-        menu_kb = InlineKeyboardMarkup([[B("⬅️ Menú", callback_data="m|menu")]])
+        menu_kb = InlineKeyboardMarkup([[B("💬 Escribir a soporte", callback_data="m|soporte")],
+                                        [B("⬅️ Menú", callback_data="m|menu")]])
         clave = f"rev_{uid}"
         if cfg(clave, "") == hoy():
             return await say(ctx, chat_id, "✅ Ya recibimos tu solicitud hoy. Te contactamos pronto.",
@@ -2322,7 +2340,9 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     "🤝 <b>Solicitud de revendedor / pedido grande</b>\n\n"
                     f"👤 <a href=\"tg://user?id={uid}\">{html.escape(u.first_name or 'Cliente')}</a>\n"
                     f"🆔 {uid}\n🔗 {html.escape(usuario)}",
-                    parse_mode="HTML")
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(
+                        [[B("💬 Responder por el bot", callback_data=f"rp|{uid}")]]))
                 enviado = True
             except Exception:
                 logging.exception("solicitud revendedor")
@@ -2362,11 +2382,55 @@ async def texto_libre(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     tipo = est[0]
     txt = m.text.strip()
+    B = InlineKeyboardButton
+
+    # El cliente le escribe a soporte
+    if tipo == "soporte":
+        ctx.user_data.pop("esperando", None)
+        ahora = time.time()
+        if ahora - _ULT_SOPORTE.get(uid, 0) < 10:
+            return await m.reply_text("⏳ Espera unos segundos antes de enviar otro mensaje.")
+        _ULT_SOPORTE[uid] = ahora
+        u = update.effective_user
+        usuario = f"@{u.username}" if u.username else "sin usuario"
+        enviado = False
+        for adm in ADMINS:
+            try:
+                await ctx.bot.send_message(
+                    adm,
+                    "💬 <b>Mensaje de soporte</b>\n\n"
+                    f"👤 {html.escape(u.first_name or 'Cliente')} • 🆔 {uid} • {html.escape(usuario)}\n\n"
+                    f"{html.escape(txt[:1500])}",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(
+                        [[B("💬 Responder por el bot", callback_data=f"rp|{uid}")]]))
+                enviado = True
+            except Exception:
+                logging.exception("mensaje a soporte")
+        if not enviado:
+            return await m.reply_text(f"⚠️ No pudimos enviar tu mensaje. Escríbenos al {PHONE}.")
+        return await m.reply_text(
+            "✅ Mensaje enviado a soporte. Te respondemos por aquí mismo.",
+            reply_markup=InlineKeyboardMarkup([[B("⬅️ Menú", callback_data="m|menu")]]))
+
+    # El admin responde a un cliente (sin mostrar su cuenta)
+    if tipo.startswith("resp:") and uid in ADMINS:
+        ctx.user_data.pop("esperando", None)
+        destino = int(tipo.split(":")[1])
+        try:
+            await ctx.bot.send_message(
+                destino, f"💬 𝗦𝗢𝗣𝗢𝗥𝗧𝗘\n\n{txt[:3500]}\n\n{BRAND}",
+                reply_markup=InlineKeyboardMarkup([[B("💬 Responder a soporte", callback_data="m|soporte")]]))
+        except Exception:
+            return await m.reply_text("❌ No pude enviarle el mensaje (puede que haya bloqueado el bot).")
+        return await m.reply_text(
+            "✅ Enviado al cliente.",
+            reply_markup=InlineKeyboardMarkup([[B("💬 Seguir respondiendo", callback_data=f"rp|{destino}")]]))
+
     if tipo != "canjear" and not txt.isdigit():
         return await m.reply_text("❌ Envía solo el ID, con números. (O toca ❌ Cancelar)")
     ctx.user_data.pop("esperando", None)
     chat_id = update.effective_chat.id
-    B = InlineKeyboardButton
 
     if tipo == "likes_id":
         montos = [100, 500, 1000, 2000]
@@ -2466,6 +2530,24 @@ def texto_top_admin(limite=15):
     return "🏆 𝗧𝗢𝗣 𝗖𝗟𝗜𝗘𝗡𝗧𝗘𝗦 (solo admin)\n\n" + "\n".join(lineas)
 
 
+@admin
+async def msg_cmd(update, ctx):
+    partes = (update.message.text or "").split(maxsplit=2)
+    if len(partes) < 3:
+        return await update.message.reply_text("❌ Uso: /msg <ID|@usuario> <mensaje>")
+    destino = resolver(partes[1])
+    if destino is None or get_user(destino) is None:
+        return await update.message.reply_text("❌ Usuario no encontrado.")
+    try:
+        await ctx.bot.send_message(
+            destino, f"💬 𝗦𝗢𝗣𝗢𝗥𝗧𝗘\n\n{partes[2][:3500]}\n\n{BRAND}",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("💬 Responder a soporte", callback_data="m|soporte")]]))
+    except Exception:
+        return await update.message.reply_text("❌ No pude enviarle el mensaje (puede que haya bloqueado el bot).")
+    await update.message.reply_text("✅ Enviado al cliente.")
+
+
 def main():
     asyncio.set_event_loop(asyncio.new_event_loop())  # compatibilidad Python 3.14
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).concurrent_updates(True).build()
@@ -2478,12 +2560,12 @@ def main():
         "add": add_cmd, "quitar": quitar_cmd, "ban": ban_cmd, "unban": unban_cmd,
         "codigo": codigo_cmd, "broadcast": broadcast, "buscar": buscar,
         "aprobar": aprobar_cmd, "rechazar": rechazar_cmd, "resetprueba": resetprueba_cmd,
-        "autoday": autoday, "autoremove": autoremove,
+        "autoday": autoday, "autoremove": autoremove, "msg": msg_cmd,
     }
     for nombre, fn in handlers.items():
         app.add_handler(CommandHandler(nombre, fn))
 
-    app.add_handler(CallbackQueryHandler(menu_cb, pattern=r"^(m|lk|ct|au|ad)\|"))
+    app.add_handler(CallbackQueryHandler(menu_cb, pattern=r"^(m|lk|ct|au|ad|rp)\|"))
     app.add_handler(CallbackQueryHandler(botones))
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, texto_libre))
