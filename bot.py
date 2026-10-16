@@ -30,7 +30,15 @@ FREE_MAX_AMOUNT = 100     # máximo de likes por envío en modo gratis
 AUTO_AMOUNT = 500         # likes diarios de cada /autoday
 
 TZ = timezone(timedelta(hours=-6))  # hora de México (reinicio a las 00:00)
-DB_PATH = os.environ.get("DB_PATH", "ciberbot.db")
+# Railway define RAILWAY_VOLUME_MOUNT_PATH cuando el servicio tiene un volumen: la base de datos
+# se guarda ahí para que NO se borre en cada despliegue. DB_PATH, si existe, manda sobre todo.
+_VOL = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "")
+DB_PATH = os.environ.get("DB_PATH") or (os.path.join(_VOL, "ciberbot.db") if _VOL else "ciberbot.db")
+os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
+EN_RAILWAY = bool(os.environ.get("RAILWAY_PROJECT_ID") or os.environ.get("RAILWAY_ENVIRONMENT_NAME")
+                  or os.environ.get("RAILWAY_SERVICE_ID"))
+DB_EN_VOLUMEN = bool(_VOL) and os.path.abspath(DB_PATH).startswith(os.path.abspath(_VOL))
+BACKUP_HORAS = float(os.environ.get("BACKUP_HORAS", "6"))   # cada cuántas horas te llega un backup
 
 PHONE = "+57 318 0051415"
 OWNER = PHONE  # solo se muestra el número de contacto
@@ -1233,6 +1241,10 @@ async def recibir_comprobante(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     if m is None or u is None:
         return
+    est = ctx.user_data.get("esperando")
+    if est and est[0] == "restaurar" and u.id in ADMINS and m.document and time.time() - est[1] <= 600:
+        ctx.user_data.pop("esperando", None)
+        return await restaurar_backup(update, ctx)
     if m.photo:
         file_id, kind = m.photo[-1].file_id, "photo"
     elif m.document:
@@ -1987,9 +1999,9 @@ async def mantenimiento_loop(app):
     while True:
         try:
             n = now()
-            if n.hour >= 3 and cfg("ultimo_backup", "") != hoy():
+            if time.time() - float(cfg("ultimo_backup_ts", "0") or 0) >= BACKUP_HORAS * 3600:
                 if await hacer_backup(app.bot):
-                    set_cfg("ultimo_backup", hoy())
+                    set_cfg("ultimo_backup_ts", time.time())
             if n.hour == 23 and n.minute >= 55 and cfg("ultimo_reporte", "") != hoy():
                 await avisar_admin(app.bot, await texto_reporte())
                 set_cfg("ultimo_reporte", hoy())
@@ -2014,6 +2026,7 @@ async def post_init(app):
     app.create_task(auto_loop(app))
     app.create_task(mantenimiento_loop(app))
     app.create_task(craft_loop(app))
+    app.create_task(aviso_inicio(app))
 
 
 # ================== MAIN ==================
@@ -2079,6 +2092,7 @@ ADMIN_AYUDA = (
     "/autoday <días> <ID> [cantidad] — Auto con tu saldo\n"
     "/autoremove <ID> — Quitar un auto\n"
     "/msg <ID|@usr> <mensaje> — Escribirle a un cliente por el bot\n"
+    "/restaurar — Restaurar un backup (.db) tras perder datos\n"
     "/admin — Abrir este panel"
 )
 
@@ -2108,6 +2122,7 @@ def kb_admin():
         [sw("free"), sw("unlimited")],
         [B("🏆 Top clientes (con usuarios)", callback_data="ad|top")],
         [B("🗄️ Backup", callback_data="ad|backup"), B("📑 Historial API", callback_data="ad|historial")],
+        [B("♻️ Restaurar backup", callback_data="ad|restaurar")],
         [B("ℹ️ Comandos con datos", callback_data="ad|ayuda")],
         [B("⬅️ Menú", callback_data="m|menu")],
     ])
@@ -2342,6 +2357,9 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         }
         if sub == "top":
             return await say(ctx, chat_id, texto_top_admin())
+        if sub == "restaurar":
+            ctx.user_data["esperando"] = ("restaurar", time.time())
+            return await say(ctx, chat_id, TEXTO_RESTAURAR)
         if sub in acciones:
             return await acciones[sub](shim, ctx)
         if sub == "ayuda":
@@ -2514,6 +2532,10 @@ async def texto_libre(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tipo = est[0]
     txt = m.text.strip()
     B = InlineKeyboardButton
+
+    # Restaurar backup: se espera un archivo, no texto
+    if tipo == "restaurar":
+        return await m.reply_text("📎 Envía el archivo .db como documento (no texto). Para cancelar usa /start.")
 
     # Likes: cantidad personalizada
     if tipo == "likes_cant":
@@ -2835,6 +2857,168 @@ def teclado_cantidades(target, tope):
     return InlineKeyboardMarkup(filas)
 
 
+# ================== PERSISTENCIA Y RESTAURACIÓN ==================
+async def aviso_inicio(app):
+    logging.info("Base de datos: %s (en volumen: %s)", os.path.abspath(DB_PATH), DB_EN_VOLUMEN)
+    if EN_RAILWAY and not DB_EN_VOLUMEN:
+        await asyncio.sleep(5)
+        await avisar_admin(
+            app.bot,
+            "🚨 ATENCIÓN: la base de datos NO está en un volumen de Railway.\n"
+            "Cada despliegue la borra (clientes, saldos y órdenes).\n\n"
+            "Solución: en tu servicio de Railway crea un Volume y vuelve a desplegar. "
+            "El bot lo usa solo.\n"
+            f"Ruta actual: {os.path.abspath(DB_PATH)}")
+
+
+TEXTO_RESTAURAR = (
+    "♻️ 𝗥𝗘𝗦𝗧𝗔𝗨𝗥𝗔𝗥 𝗕𝗔𝗖𝗞𝗨𝗣\n\n"
+    "Envía ahora el archivo de backup (.db) que te mandó el bot (se llama backup_FECHA.db).\n\n"
+    "• Los créditos del backup SE SUMAN a los actuales (pensado para cuando la base se reinició en blanco).\n"
+    "• Restaura solo UN backup, el más reciente anterior a la pérdida.\n"
+    "• Lo que pasó después de ese backup no se recupera: revisa los saldos con /buscar.\n"
+    "• Antes de mezclar se guarda una copia de la base actual."
+)
+
+
+@admin_privado
+async def restaurar_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data["esperando"] = ("restaurar", time.time())
+    await update.message.reply_text(TEXTO_RESTAURAR)
+
+
+def _copiar(src, tablas, tabla, donde="", ignorar=False):
+    if tabla not in tablas:
+        return 0
+    cols_src = {r[1] for r in src.execute(f"PRAGMA table_info({tabla})")}
+    cols = [r[1] for r in db.execute(f"PRAGMA table_info({tabla})") if r[1] != "id" and r[1] in cols_src]
+    if not cols:
+        return 0
+    n = 0
+    for r in src.execute(f"SELECT {','.join(cols)} FROM {tabla} {donde}").fetchall():
+        cur = db.execute(
+            f"INSERT {'OR IGNORE ' if ignorar else ''}INTO {tabla}({','.join(cols)}) "
+            f"VALUES({','.join('?' * len(cols))})", tuple(r))
+        n += max(cur.rowcount, 0)
+    return n
+
+
+def restaurar_desde(ruta):
+    """Mezcla un backup con la base actual. Los créditos del backup SE SUMAN a los actuales."""
+    src = sqlite3.connect(ruta)
+    src.row_factory = sqlite3.Row
+    try:
+        if src.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise ValueError("el archivo está dañado")
+        tablas = {r[0] for r in src.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "users" not in tablas:
+            raise ValueError("no parece un backup de este bot")
+
+        previa = f"antes_de_restaurar_{now():%Y%m%d_%H%M%S}.db"
+        copia = sqlite3.connect(previa)
+        db.backup(copia)
+        copia.close()
+
+        res = {"nuevos": 0, "actualizados": 0, "creditos": 0, "previa": previa}
+        cols_users = {r[1] for r in db.execute("PRAGMA table_info(users)")}
+        ahora = now().isoformat(timespec="seconds")
+        try:
+            for r in src.execute("SELECT * FROM users").fetchall():
+                d = dict(r)
+                uid = d["user_id"]
+                cred = int(d.get("credits") or 0)
+                ex = get_user(uid)
+                if ex is None:
+                    cols = [c for c in d if c in cols_users]
+                    db.execute(f"INSERT INTO users({','.join(cols)}) VALUES({','.join('?' * len(cols))})",
+                               [d[c] for c in cols])
+                    res["nuevos"] += 1
+                else:
+                    sets, vals = [], []
+                    if cred:
+                        sets.append("credits=COALESCE(credits,0)+?")
+                        vals.append(cred)
+                    if d.get("ref_by") is not None and ex["ref_by"] is None:
+                        sets.append("ref_by=?")
+                        vals.append(d["ref_by"])
+                    for c in ("ref_paid", "prueba_usada", "banned"):
+                        if d.get(c) and not ex[c]:
+                            sets.append(f"{c}=?")
+                            vals.append(d[c])
+                    if d.get("created") and (not ex["created"] or d["created"] < ex["created"]):
+                        sets.append("created=?")
+                        vals.append(d["created"])
+                    if d.get("username") and not ex["username"]:
+                        sets.append("username=?")
+                        vals.append(d["username"])
+                    if sets:
+                        db.execute(f"UPDATE users SET {', '.join(sets)} WHERE user_id=?", vals + [uid])
+                    res["actualizados"] += 1
+                if cred:
+                    saldo = db.execute("SELECT credits FROM users WHERE user_id=?", (uid,)).fetchone()[0]
+                    db.execute(
+                        "INSERT INTO movimientos(ts,user_id,delta,tipo,nota,saldo) VALUES(?,?,?,?,?,?)",
+                        (ahora, uid, cred, "ajuste", "restauración de backup", saldo))
+                    res["creditos"] += cred
+            res["movimientos"] = _copiar(src, tablas, "movimientos")
+            res["envios"] = _copiar(src, tablas, "logs")
+            res["codigos"] = _copiar(src, tablas, "codigos", ignorar=True)
+            res["pruebas"] = _copiar(src, tablas, "pruebas", ignorar=True)
+            res["autos"] = _copiar(src, tablas, "autos",
+                                   donde=f"WHERE owner_id IS NOT NULL OR expires >= '{hoy()}'", ignorar=True)
+            res["craft"] = _copiar(src, tablas, "craft_pedidos",
+                                   donde="WHERE estado IN ('queued','processing','revisar')")
+            if "config" in tablas:
+                for r in src.execute(
+                        "SELECT key, value FROM config WHERE key IN ('top_salt','bot_on','free','unlimited','prueba') "
+                        "OR key LIKE 'rev\\_%' ESCAPE '\\'").fetchall():
+                    db.execute("INSERT OR IGNORE INTO config(key,value) VALUES(?,?)", (r[0], r[1]))
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        return res
+    finally:
+        src.close()
+
+
+async def restaurar_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    m = update.message
+    doc = m.document
+    if (doc.file_size or 0) > 20 * 1024 * 1024:
+        return await m.reply_text("❌ El archivo es muy grande (máximo 20 MB).")
+    ruta = f"restaurar_{int(time.time())}.db"
+    try:
+        f = await ctx.bot.get_file(doc.file_id)
+        await f.download_to_drive(ruta)
+        with open(ruta, "rb") as fh:
+            sha = hashlib.sha256(fh.read()).hexdigest()[:16]
+        if cfg(f"restaurado_{sha}", ""):
+            return await m.reply_text(
+                "⚠️ Ya restauraste exactamente ese backup. Hacerlo otra vez duplicaría los saldos, "
+                "así que lo bloqueé.")
+        res = restaurar_desde(ruta)
+        set_cfg(f"restaurado_{sha}", hoy())
+        await m.reply_text(
+            "✅ Backup restaurado\n\n"
+            f"👥 Usuarios nuevos: {res['nuevos']} • ya existían: {res['actualizados']}\n"
+            f"💳 Créditos sumados: {res['creditos']:,}\n"
+            f"📜 Movimientos: {res['movimientos']} • Envíos: {res['envios']} • Códigos: {res['codigos']} "
+            f"• Pruebas: {res['pruebas']} • Autos: {res['autos']}\n\n"
+            f"🗂️ Copia de la base anterior: {res['previa']}\n"
+            "⚠️ Revisa los saldos de tus clientes con /buscar. Lo ocurrido después de ese backup no se recupera.")
+    except ValueError as e:
+        await m.reply_text(f"❌ No pude restaurar: {e}.")
+    except Exception:
+        logging.exception("restaurar")
+        await m.reply_text("❌ No pude restaurar ese archivo. ¿Es un backup (.db) de este bot?")
+    finally:
+        try:
+            os.remove(ruta)
+        except OSError:
+            pass
+
+
 def main():
     asyncio.set_event_loop(asyncio.new_event_loop())  # compatibilidad Python 3.14
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).concurrent_updates(True).build()
@@ -2847,7 +3031,7 @@ def main():
         "add": add_cmd, "quitar": quitar_cmd, "ban": ban_cmd, "unban": unban_cmd,
         "codigo": codigo_cmd, "broadcast": broadcast, "buscar": buscar,
         "aprobar": aprobar_cmd, "rechazar": rechazar_cmd, "resetprueba": resetprueba_cmd,
-        "autoday": autoday, "autoremove": autoremove, "msg": msg_cmd,
+        "autoday": autoday, "autoremove": autoremove, "msg": msg_cmd, "restaurar": restaurar_cmd,
     }
     for nombre, fn in handlers.items():
         app.add_handler(CommandHandler(nombre, fn))
