@@ -61,6 +61,12 @@ CRAFT_BASE = "https://lunexiscraft.squareweb.app"
 CRAFT_KEY = os.environ.get("CRAFT_API_KEY", "")   # la key va en variable de entorno, nunca en el código
 CRAFT_SEGUIDORES = 65000                         # el pack nivel 6 entrega 65,000 seguidores
 
+# ----- Seguidores Craftland por cantidad ("envío avulso") -----
+# {seguidores: precio en MXN}. Entre escalones se interpola y se redondea hacia arriba a 5 pesos.
+PRECIOS_SEGUIDORES = {5000: 25, 10000: 50, 20000: 75, 30000: 100, 50000: 135, 70000: 170, 100000: 200}
+SEG_MIN, SEG_MAX = 5000, 100000   # la web del proveedor permite de 1,000 a 100,000 (múltiplos de 1,000)
+CRAFT_NIVEL6 = 60000              # seguidores para el nivel 6 (según la web del proveedor)
+
 CONFIRMAR_DESDE = 1000    # envíos de esta cantidad o más piden confirmación al cliente
 LOW_CREDITS = 200         # aviso de "pocos créditos" al cliente
 REF_BONUS = 100           # créditos que gana quien invita, cuando el invitado hace su 1ª recarga
@@ -1070,10 +1076,17 @@ ESTADO_CRAFT = {"queued": "⏳ en fila", "processing": "⚙️ enviando", "compl
 async def craft_mis_pedidos(ctx, uid, chat_id):
     rows = db.execute(
         "SELECT * FROM craft_pedidos WHERE user_id=? ORDER BY id DESC LIMIT 5", (uid,)).fetchall()
-    if not rows:
-        return await say(ctx, chat_id, "📭 Aún no tienes pedidos de Nick Color Craftland.")
-    lineas = [f"🧾 #{r['code'] or '—'} • 🆔 {r['player_id']} • {ESTADO_CRAFT.get(r['estado'], r['estado'])}"
+    cant = db.execute(
+        "SELECT * FROM ordenes WHERE user_id=? AND producto='craft_avulso' AND estado NOT IN "
+        "('pendiente','cancelada') ORDER BY id DESC LIMIT 5", (uid,)).fetchall()
+    if not rows and not cant:
+        return await say(ctx, chat_id, "📭 Aún no tienes pedidos de Craftland.")
+    lineas = [f"🎨 #{r['code'] or '—'} • 🆔 {r['player_id']} • {ESTADO_CRAFT.get(r['estado'], r['estado'])}"
               for r in rows]
+    estados = {"en_revision": "🔎 en revisión", "por_entregar": "📦 enviando", "entregada": "✅ entregado",
+               "rechazada": "❌ rechazado", "aprobada": "✅ aprobado"}
+    lineas += [f"👥 +{o['likes']:,} • 🆔 {o['player_id']} • {estados.get(o['estado'], o['estado'])}"
+               for o in cant]
     await say(ctx, chat_id, "🎨 𝗠𝗜𝗦 𝗣𝗘𝗗𝗜𝗗𝗢𝗦\n\n" + "\n".join(lineas))
 
 
@@ -1160,6 +1173,9 @@ def texto_pago(oid, likes, monto, producto="likes", player_id=None):
     if producto == "craft":
         compra = ("🎨 Compra: <b>Nick Color Craftland</b>\n"
                   f"🆔 Player ID: <b>{e(str(player_id))}</b>\n")
+    elif producto == "craft_avulso":
+        compra = (f"👥 Compra: <b>+{likes:,} seguidores Craftland</b>\n"
+                  f"🆔 Player ID: <b>{e(str(player_id))}</b>\n")
     else:
         compra = f"❤️ Compra: <b>{likes:,}</b> likes (se guardan como créditos)\n"
     return (
@@ -1245,6 +1261,8 @@ async def recibir_comprobante(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     nombre = f"@{u.username}" if u.username else (u.first_name or "sin usuario")
     if o["producto"] == "craft":
         detalle = f"🎨 Nick Color Craftland • ID {o['player_id']}"
+    elif o["producto"] == "craft_avulso":
+        detalle = f"👥 +{o['likes']:,} seguidores Craftland • ID {o['player_id']}"
     else:
         detalle = f"❤️ {o['likes']:,} likes"
     cap = (
@@ -1294,6 +1312,30 @@ async def aplicar_decision(bot, admin_id, admin_tag, oid, accion):
         return False, f"Esa orden ya está: {o['estado']}."
     cliente = o["user_id"]
     if accion == "apr":
+        if o["producto"] == "craft_avulso":
+            db.execute("UPDATE ordenes SET estado='por_entregar' WHERE id=?", (oid,))
+            db.commit()
+            try:
+                await bot.send_message(
+                    cliente,
+                    "🎉 ¡Pago aprobado!\n\n"
+                    f"👥 +{o['likes']:,} seguidores Craftland\n🆔 {o['player_id']}\n"
+                    f"⏳ Estamos enviando tu pedido. Te aviso aquí cuando termine.\n\n{BRAND}")
+            except Exception:
+                pass
+            for adm in ADMINS:
+                try:
+                    await bot.send_message(
+                        adm,
+                        f"📦 ENTREGA PENDIENTE • ORDEN #{oid}\n\n"
+                        f"👥 +{o['likes']:,} seguidores Craftland\n🆔 Player ID: {o['player_id']}\n"
+                        f"💵 Pagado: ${_fmt(o['monto'])} MXN\n\n"
+                        "Envíalo desde el panel del proveedor (Envío avulso) y luego toca el botón.",
+                        reply_markup=InlineKeyboardMarkup(
+                            [[InlineKeyboardButton("✅ Marcar entregado", callback_data=f"ent|{oid}")]]))
+                except Exception:
+                    pass
+            return True, f"✅ APROBADA por {admin_tag} • entrega pendiente (te llegó al privado)"
         if o["producto"] == "craft":
             ok, res = await craft_crear_en_proveedor(bot, cliente, cliente, o["player_id"], orden_id=oid)
             if not ok:
@@ -1368,7 +1410,8 @@ async def ordenes_cmd(update, ctx):
     if not rows:
         return await update.message.reply_text("📭 Aún no hay órdenes.")
     est = {"pendiente": "🕓 esperando comprobante", "en_revision": "🔎 en revisión",
-           "aprobada": "✅ aprobada", "rechazada": "❌ rechazada", "cancelada": "🚫 cancelada"}
+           "aprobada": "✅ aprobada", "rechazada": "❌ rechazada", "cancelada": "🚫 cancelada",
+           "por_entregar": "📦 por entregar", "entregada": "✅ entregada"}
     rev = sum(1 for r in rows if r["estado"] == "en_revision")
     lineas = [
         f"#{r['id']} • 🆔 {r['user_id']} • {r['likes']:,} • ${_fmt(r['monto'])} • "
@@ -1388,7 +1431,8 @@ async def precios(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     B = InlineKeyboardButton
     await update.message.reply_text(
         "❤️ PRECIOS DE LIKES FREE FIRE — CIBERSTORE\n\n" + "\n".join(lineas) + "\n\n"
-        f"🎨 Nick Color Craftland — ${CRAFT_PRECIO_MXN} MXN\n\n"
+        f"🎨 Nick Color Craftland — ${CRAFT_PRECIO_MXN} MXN\n"
+        f"👥 Seguidores Craftland — desde ${PRECIOS_SEGUIDORES[SEG_MIN]} MXN ({SEG_MIN:,})\n\n"
         f"💎 Pedidos de {PEDIDO_GRANDE:,} likes en adelante: ¡mejoramos el precio!\n"
         "🤝 Se buscan revendedores de likes.\n\n"
         "🏦 Pago por transferencia bancaria México (MXN)\n"
@@ -2009,6 +2053,7 @@ PEDIR = {
     "craft_comprar": ("craft_id", "🎨 Envía el Player ID de Free Fire que recibirá el pack (solo números):"),
     "canjear": ("canjear", "🎟 Envía tu código de recarga:"),
     "auto_nuevo": ("auto_id", "🤖 Envía el ID de Free Fire que recibirá los likes cada día (solo números):"),
+    "cs_otra": ("cs_cant", f"✏️ Escribe cuántos seguidores quieres (múltiplos de 1,000, de {SEG_MIN:,} a {SEG_MAX:,}):"),
     "soporte": ("soporte", "💬 Escribe tu mensaje para soporte (solo texto) y lo enviamos. Te respondemos por aquí mismo."),
 }
 
@@ -2178,6 +2223,57 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Se la envío por el bot y tu cuenta no se muestra.",
             reply_markup=InlineKeyboardMarkup([[B("❌ Cancelar", callback_data="m|cancel")]]))
 
+    # ----- Seguidores Craftland por cantidad -----
+    if partes[0] == "cs":
+        if len(partes) == 2 and partes[1].isdigit():
+            n = int(partes[1])
+            precio = precio_seguidores(n)
+            if precio is None:
+                return
+            return await pedir_id_seguidores(ctx, chat_id, n)
+        if len(partes) == 4 and partes[1] == "ok" and partes[2].isdigit() and partes[3].isdigit():
+            n = int(partes[3])
+            precio = precio_seguidores(n)
+            if precio is None:
+                return
+            try:
+                await q.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            oid, monto = crear_orden(uid, n, "craft_avulso", partes[2], precio)
+            kb = InlineKeyboardMarkup([[B("❌ Cancelar orden", callback_data=f"cx|{oid}")]])
+            return await ctx.bot.send_message(
+                chat_id, texto_pago(oid, n, monto, "craft_avulso", partes[2]),
+                parse_mode="HTML", reply_markup=kb)
+        return
+
+    # ----- Admin: entrega manual completada -----
+    if partes[0] == "ent" and len(partes) == 2 and partes[1].isdigit():
+        if uid not in ADMINS:
+            return
+        oid = int(partes[1])
+        o = db.execute("SELECT * FROM ordenes WHERE id=?", (oid,)).fetchone()
+        cur = db.execute("UPDATE ordenes SET estado='entregada' WHERE id=? AND estado='por_entregar'", (oid,))
+        db.commit()
+        if not o or cur.rowcount != 1:
+            return await say(ctx, chat_id, "⚠️ Esa orden ya estaba entregada o no existe.")
+        texto = ("👥 SEGUIDORES CRAFTLAND ENTREGADOS\n"
+                 "━━━━━━━━━━━━━━━━━━━━━━\n"
+                 f"↬ ID: {o['player_id']}\n"
+                 f"↬ Seguidores: +{o['likes']:,}\n"
+                 "━━━━━━━━━━━━━━━━━━━━━━\n"
+                 f"↬ Contacto: {CONTACTO}")
+        enviada = await enviar_referencia(ctx.bot, texto)
+        extra = ""
+        if enviada:
+            extra = (f"\n\n📨 Referencia enviada a {await nombre_canal(ctx.bot)}"
+                     f"\n🔗 Ver referencias: {LINK_REFERENCIAS}")
+        try:
+            await ctx.bot.send_message(o["user_id"], "✅ ¡Entrega completada!\n\n" + texto + extra)
+        except Exception:
+            await say(ctx, chat_id, "⚠️ Marcada como entregada, pero no pude avisarle al cliente.")
+        return await editar(q, f"✅ Orden #{oid} marcada como entregada y avisada al cliente.")
+
     # ----- Craftland: continuar -----
     if partes[0] == "ct":
         if partes[1:2] == ["ok"] and len(partes) == 3 and partes[2].isdigit():
@@ -2281,10 +2377,12 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "╔══════════════╗\n  🎨 𝗡𝗜𝗖𝗞 𝗖𝗢𝗟𝗢𝗥 𝗖𝗥𝗔𝗙𝗧𝗟𝗔𝗡𝗗\n╚══════════════╝\n\n"
             f"▫️ Pack Nivel 6 • +{CRAFT_SEGUIDORES:,} seguidores\n"
             f"▫️ Precio: ${CRAFT_PRECIO_MXN} MXN\n"
+            f"▫️ Seguidores por cantidad: desde ${PRECIOS_SEGUIDORES[SEG_MIN]} MXN\n"
             "▫️ Pago: transferencia bancaria\n"
             f"▫️ Estado: {estado}\n\nElige una opción 👇",
             InlineKeyboardMarkup([
                 [B(f"🎨 Comprar ahora • ${CRAFT_PRECIO_MXN} MXN", callback_data="m|craft_comprar")],
+                [B("👥 Seguidores por cantidad", callback_data="m|craft_seg")],
                 [B("📦 Mis pedidos", callback_data="m|craft_pedidos")],
                 volver]))
 
@@ -2298,6 +2396,39 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 [B("🎟 Canjear código", callback_data="m|canjear"), B("📊 Mi estado", callback_data="m|status")],
                 [B("🛒 Comprar likes", callback_data="m|comprar")],
                 volver]))
+
+    if accion == "likes_otra":
+        if not ctx.user_data.get("likes_id"):
+            return await say(ctx, chat_id, "⏳ Se venció la solicitud. Empieza otra vez desde ❤️ Likes.")
+        tope = limite_envio(uid)
+        if tope <= 0:
+            return await say(ctx, chat_id, SIN_ACCESO)
+        ctx.user_data["esperando"] = ("likes_cant", time.time())
+        return await say(
+            ctx, chat_id,
+            f"✏️ Escribe cuántos likes quieres enviar al ID {ctx.user_data['likes_id']}.\n"
+            f"Puedes enviar de 1 a {tope:,}.",
+            reply_markup=InlineKeyboardMarkup([[B("❌ Cancelar", callback_data="m|cancel")]]))
+
+    if accion == "craft_seg":
+        filas, fila = [], []
+        for n, precio in PRECIOS_SEGUIDORES.items():
+            fila.append(B(f"{n:,} • ${precio}", callback_data=f"cs|{n}"))
+            if len(fila) == 2:
+                filas.append(fila)
+                fila = []
+        if fila:
+            filas.append(fila)
+        filas.append([B("✏️ Otra cantidad", callback_data="m|cs_otra")])
+        filas.append([B("⬅️ Volver", callback_data="m|craft")])
+        return await editar(
+            q,
+            "╔══════════════╗\n  👥 𝗦𝗘𝗚𝗨𝗜𝗗𝗢𝗥𝗘𝗦 𝗖𝗥𝗔𝗙𝗧𝗟𝗔𝗡𝗗\n╚══════════════╝\n\n"
+            "▫️ Elige cuántos seguidores quieres (precio en MXN)\n"
+            f"▫️ Otra cantidad: de {SEG_MIN:,} a {SEG_MAX:,}, múltiplos de 1,000\n"
+            "▫️ Primero verificamos tu Player ID\n"
+            "🏦 Pago por transferencia bancaria\n\nToca una opción 👇",
+            InlineKeyboardMarkup(filas))
 
     if accion == "autos":
         texto, kb = vista_autos(uid)
@@ -2384,6 +2515,53 @@ async def texto_libre(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     txt = m.text.strip()
     B = InlineKeyboardButton
 
+    # Likes: cantidad personalizada
+    if tipo == "likes_cant":
+        ctx.user_data.pop("esperando", None)
+        target = ctx.user_data.get("likes_id")
+        if not target:
+            return await m.reply_text("⏳ Se venció la solicitud. Empieza otra vez desde el menú.",
+                                      reply_markup=kb_menu_principal(uid))
+        limpio = txt.replace(",", "").replace(".", "").replace(" ", "")
+        tope = limite_envio(uid)
+        if tope <= 0:
+            return await m.reply_text(SIN_ACCESO, reply_markup=kb_menu_principal(uid))
+        n = int(limpio) if limpio.isdigit() else 0
+        error = None
+        if n < 1:
+            error = "❌ Escribe un número válido. Ejemplo: 1980"
+        elif n > MAX_AMOUNT:
+            error = f"❌ El máximo por envío es {MAX_AMOUNT:,} likes (límite del servicio)."
+        elif n > tope:
+            error = (f"❌ Solo puedes enviar hasta {tope:,} likes ahora"
+                     + (f" (tienes {creditos(uid):,} créditos)." if uid not in ADMINS else "."))
+        if error:
+            ctx.user_data["esperando"] = ("likes_cant", time.time())
+            return await m.reply_text(error + "\nEscribe otra cantidad o toca ❌ Cancelar.")
+        return await procesar_likes(ctx, uid, update.effective_chat.id, target, n)
+
+    # Seguidores por cantidad: cantidad personalizada
+    if tipo == "cs_cant":
+        ctx.user_data.pop("esperando", None)
+        n = int(txt.replace(",", "").replace(".", "").replace(" ", "") or 0) if \
+            txt.replace(",", "").replace(".", "").replace(" ", "").isdigit() else 0
+        precio = precio_seguidores(n)
+        if precio is None:
+            ctx.user_data["esperando"] = ("cs_cant", time.time())
+            return await m.reply_text(
+                f"❌ La cantidad debe ser de {SEG_MIN:,} a {SEG_MAX:,}, en múltiplos de 1,000.\n"
+                "Ejemplo: 15000")
+        return await pedir_id_seguidores(ctx, update.effective_chat.id, n)
+
+    # Seguidores por cantidad: Player ID a verificar
+    if tipo == "cs_id" and txt.isdigit():
+        ctx.user_data.pop("esperando", None)
+        n = ctx.user_data.get("cs_cant")
+        if not n:
+            return await m.reply_text("⏳ Se venció la solicitud. Elige la cantidad otra vez desde el menú.",
+                                      reply_markup=kb_menu_principal(uid))
+        return await craft_seg_preview(ctx, uid, update.effective_chat.id, txt, n)
+
     # El cliente le escribe a soporte
     if tipo == "soporte":
         ctx.user_data.pop("esperando", None)
@@ -2433,13 +2611,12 @@ async def texto_libre(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
     if tipo == "likes_id":
-        montos = [100, 500, 1000, 2000]
-        return await say(
-            ctx, chat_id, f"❤️ ID {txt}\n¿Cuántos likes quieres enviar?",
-            reply_markup=InlineKeyboardMarkup([
-                [B(f"{a:,}", callback_data=f"lk|{txt}|{a}") for a in montos[:2]],
-                [B(f"{a:,}", callback_data=f"lk|{txt}|{a}") for a in montos[2:]],
-                [B("⬅️ Menú", callback_data="m|menu")]]))
+        tope = limite_envio(uid)
+        if tope <= 0:
+            return await say(ctx, chat_id, SIN_ACCESO, reply_markup=kb_menu_principal(uid))
+        ctx.user_data["likes_id"] = txt
+        return await say(ctx, chat_id, f"❤️ ID {txt}\n{_saldo_linea(uid)}¿Cuántos likes quieres enviar?",
+                         reply_markup=teclado_cantidades(txt, tope))
     if tipo == "auto_id":
         return await say(
             ctx, chat_id, f"🤖 Auto para el ID {txt}\n\n¿Por cuántos días?",
@@ -2548,6 +2725,116 @@ async def msg_cmd(update, ctx):
     await update.message.reply_text("✅ Enviado al cliente.")
 
 
+# ================== SEGUIDORES CRAFTLAND POR CANTIDAD ==================
+def precio_seguidores(n):
+    """Precio en MXN de n seguidores (múltiplos de 1,000). None si la cantidad no es válida."""
+    if not isinstance(n, int) or not SEG_MIN <= n <= SEG_MAX or n % 1000:
+        return None
+    if n in PRECIOS_SEGUIDORES:
+        return PRECIOS_SEGUIDORES[n]
+    claves = sorted(PRECIOS_SEGUIDORES)
+    for a, b in zip(claves, claves[1:]):
+        if a < n < b:
+            p = PRECIOS_SEGUIDORES[a] + (PRECIOS_SEGUIDORES[b] - PRECIOS_SEGUIDORES[a]) * (n - a) / (b - a)
+            return int(math.ceil(p / 5) * 5)
+    return None
+
+
+async def pedir_id_seguidores(ctx, chat_id, n):
+    ctx.user_data["cs_cant"] = n
+    ctx.user_data["esperando"] = ("cs_id", time.time())
+    await say(
+        ctx, chat_id,
+        f"👥 +{n:,} seguidores • ${precio_seguidores(n)} MXN\n\n"
+        "Envía el Player ID de Free Fire (solo números) para verificar que puede recibirlos:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="m|cancel")]]))
+
+
+async def craft_seg_preview(ctx, uid, chat_id, player_id, n):
+    """Verifica el ID con el proveedor y muestra cuántos seguidores tendría después del envío."""
+    if not CRAFT_KEY:
+        return await say(ctx, chat_id, "👥 Este servicio no está disponible por ahora.")
+    if cfg("bot_on", "1") == "0" and uid not in ADMINS:
+        return await say(ctx, chat_id, "🔴 El bot está apagado por el momento.\n\n" + BRAND)
+    precio = precio_seguidores(n)
+    if precio is None:
+        return await say(ctx, chat_id, "❌ Cantidad no válida.")
+    try:
+        code, d = await craft_api("GET", f"/api/v1/player/{player_id}")
+    except Exception:
+        logging.exception("seg preview")
+        return await say(ctx, chat_id, "❌ No se pudo conectar con el servicio. Intenta de nuevo.")
+    if code != 200:
+        if code in (401, 403):
+            await avisar_admin(ctx.bot, f"⚠️ Craftland: la API respondió {code}. Revisa tu API key del proveedor.")
+        return await say(ctx, chat_id, craft_error(code, d))
+
+    nick = pick(d, "nickname", "nick", "apelido", "player_nickname", default="N/D")
+    region = pick(d, "region", "regiao", default="N/D")
+    ahora = pick(d, "followers", "seguidores")
+    if isinstance(ahora, int) and not isinstance(ahora, bool):
+        despues = ahora + n
+        faltan = max(0, CRAFT_NIVEL6 - despues)
+        lineas = (f"↬ Seguidores ahora: {ahora:,}\n"
+                  f"↬ Después del envío: {despues:,}\n"
+                  + ("↬ Nivel 6: ✅ lo alcanza con este envío\n" if faltan == 0
+                     else f"↬ Faltarían para nivel 6: {faltan:,}\n"))
+    else:
+        lineas = "↬ Seguidores ahora: N/D\n"
+    aviso = ""
+    if pick(d, "eligible") is False:
+        aviso = ("\n⚠️ Este ID ya recibió el pack nivel 6. Confirmaremos con el proveedor que pueda "
+                 "recibir esta cantidad; si no se puede, te devolvemos tu pago.\n")
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("💳 Continuar al pago", callback_data=f"cs|ok|{player_id}|{n}"),
+        InlineKeyboardButton("❌ Cancelar", callback_data="m|cancel"),
+    ]])
+    await say(
+        ctx, chat_id,
+        "👥 SEGUIDORES CRAFTLAND\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"↬ Jugador: {nick}\n"
+        f"↬ ID: {player_id}\n"
+        f"↬ Región: {region}\n"
+        f"{lineas}"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"↬ Cantidad: +{n:,} seguidores\n"
+        f"↬ Precio: ${precio} MXN\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{aviso}¿Es tu cuenta? Confirma para continuar.",
+        reply_markup=kb)
+
+
+# ================== CANTIDADES DE LIKES ==================
+def limite_envio(uid):
+    """Máximo de likes que este usuario puede enviar en un envío (0 = no puede enviar)."""
+    if uid in ADMINS or cfg("unlimited") == "1":
+        return MAX_AMOUNT
+    c = creditos(uid)
+    if c > 0:
+        return min(MAX_AMOUNT, c)
+    if cfg("free") == "1":
+        return FREE_MAX_AMOUNT
+    return 0
+
+
+def _saldo_linea(uid):
+    return "" if uid in ADMINS else f"💳 Tus créditos: {creditos(uid):,}\n"
+
+
+def teclado_cantidades(target, tope):
+    """Botones de cantidad: las estándar que le alcanzan, 'Todo' y 'Otra cantidad'."""
+    B = InlineKeyboardButton
+    estandar = [a for a in (100, 500, 1000, 2000) if a <= tope]
+    botones = [B(f"{a:,}", callback_data=f"lk|{target}|{a}") for a in estandar]
+    if tope not in estandar:
+        botones.append(B(f"💯 Todo ({tope:,})", callback_data=f"lk|{target}|{tope}"))
+    filas = [botones[i:i + 2] for i in range(0, len(botones), 2)]
+    filas.append([B("✏️ Otra cantidad", callback_data="m|likes_otra")])
+    filas.append([B("⬅️ Menú", callback_data="m|menu")])
+    return InlineKeyboardMarkup(filas)
+
+
 def main():
     asyncio.set_event_loop(asyncio.new_event_loop())  # compatibilidad Python 3.14
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).concurrent_updates(True).build()
@@ -2565,7 +2852,7 @@ def main():
     for nombre, fn in handlers.items():
         app.add_handler(CommandHandler(nombre, fn))
 
-    app.add_handler(CallbackQueryHandler(menu_cb, pattern=r"^(m|lk|ct|au|ad|rp)\|"))
+    app.add_handler(CallbackQueryHandler(menu_cb, pattern=r"^(m|lk|ct|au|ad|rp|cs|ent)\|"))
     app.add_handler(CallbackQueryHandler(botones))
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, texto_libre))
