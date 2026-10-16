@@ -46,13 +46,14 @@ LINK_REFERENCIAS = "https://whatsapp.com/channel/0029Vb7uTj165yDEGRqavR14"
 
 # ----- Precios de likes: {likes: (USD, MXN)}. Se paga por transferencia en MXN -----
 PRECIOS_LIKES = {
-    2000: (8, 90), 4000: (15, 169), 6000: (21, 236), 8000: (27, 304), 10000: (32, 360),
-    20000: (60, 675), 40000: (112, 1260), 60000: (159, 1789), 80000: (204, 2295),
-    100000: (245, 2756), 200000: (470, 5288), 400000: (880, 9900), 600000: (1260, 14175),
-    800000: (1600, 18000), 1000000: (1900, 21375),
+    2000: (6, 110), 4000: (11, 205), 6000: (16, 295), 8000: (20, 370), 10000: (24, 445),
+    20000: (45, 835), 40000: (84, 1550), 60000: (119, 2200), 80000: (153, 2830),
+    100000: (184, 3410), 200000: (353, 6530), 400000: (660, 12200), 600000: (945, 17500),
+    800000: (1200, 22200), 1000000: (1425, 26400),
 }
 PAQUETES = list(PRECIOS_LIKES)
 CRAFT_PRECIO_MXN = 300    # precio del Nick Color Craftland (pago por transferencia)
+PEDIDO_GRANDE = 10000     # desde esta cantidad de likes se ofrece precio especial / revendedores
 
 # ----- Nick Color Craftland (API del proveedor de Craftland) -----
 CRAFT_BASE = "https://lunexiscraft.squareweb.app"
@@ -448,6 +449,9 @@ async def ayuda(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Te avisamos aquí cuando esté listo.\n\n"
         "🎁 𝗣𝗥𝗨𝗘𝗕𝗔 𝗚𝗥𝗔𝗧𝗜𝗦\n"
         f"{PRUEBA_LIKES} likes gratis, una sola vez por usuario y por ID.\n\n"
+        "🤝 𝗥𝗘𝗩𝗘𝗡𝗗𝗘𝗗𝗢𝗥𝗘𝗦\n"
+        f"Se buscan revendedores. Pedidos desde {PEDIDO_GRANDE:,} likes: precio especial. "
+        "Toca «Revendedores» en el menú.\n\n"
         f"📲 Soporte: {PHONE}\n\n{BRAND}",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🟢 Ver referencias", url=LINK_REFERENCIAS)],
@@ -1194,12 +1198,14 @@ async def comprar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             fila = []
     if fila:
         filas.append(fila)
+    filas.append([B("💎 Pedido grande / 🤝 Revendedores", callback_data="m|revendedor")])
     filas.append([B("⬅️ Menú", callback_data="m|menu")])
     await update.message.reply_text(
         "╔══════════════╗\n  🛒 𝗖𝗢𝗠𝗣𝗥𝗔𝗥 𝗟𝗜𝗞𝗘𝗦\n╚══════════════╝\n\n"
         "▫️ Elige tu paquete (precio en MXN)\n"
         "▫️ 1 like comprado = 1 crédito\n"
         "🏦 Pago: Transferencia Bancaria México\n\n"
+        f"💎 Desde {PEDIDO_GRANDE:,} likes: pregunta por precio especial.\n\n"
         "Toca un paquete 👇",
         reply_markup=InlineKeyboardMarkup(filas))
 
@@ -1381,10 +1387,13 @@ async def precios(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "❤️ PRECIOS DE LIKES FREE FIRE — CIBERSTORE\n\n" + "\n".join(lineas) + "\n\n"
         f"🎨 Nick Color Craftland — ${CRAFT_PRECIO_MXN} MXN\n\n"
+        f"💎 Pedidos de {PEDIDO_GRANDE:,} likes en adelante: ¡mejoramos el precio!\n"
+        "🤝 Se buscan revendedores de likes.\n\n"
         "🏦 Pago por transferencia bancaria México (MXN)\n"
         f"📲 Soporte: {PHONE}\n\n{BRAND}",
         reply_markup=InlineKeyboardMarkup([
             [B("🛒 Comprar likes", callback_data="m|comprar"), B("🎨 Nick Color", callback_data="m|craft")],
+            [B("💎 Pedido grande / 🤝 Revendedores", callback_data="m|revendedor")],
             [B("⬅️ Menú", callback_data="m|menu")]]))
 
 
@@ -1974,7 +1983,7 @@ def kb_menu_principal(uid=None):
         [B("🎨 Nick Color Craftland", callback_data="m|craft")],
         [B("🛒 Comprar likes", callback_data="m|comprar"), B("💰 Precios", callback_data="m|precios")],
         [B("💳 Mi cuenta", callback_data="m|cuenta"), B("🎁 Prueba gratis", callback_data="m|prueba")],
-        [B("🆘 Ayuda y soporte", callback_data="m|ayuda")],
+        [B("🆘 Ayuda y soporte", callback_data="m|ayuda"), B("🤝 Revendedores", callback_data="m|revendedor")],
     ]
     if uid in ADMINS:
         filas.append([B("👑 Panel admin", callback_data="ad|panel")])
@@ -2272,6 +2281,50 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if accion == "autos":
         texto, kb = vista_autos(uid)
         return await editar(q, texto, kb)
+
+    if accion == "revendedor":
+        return await editar(
+            q,
+            "╔══════════════╗\n  🤝 𝗥𝗘𝗩𝗘𝗡𝗗𝗘𝗗𝗢𝗥𝗘𝗦\n╚══════════════╝\n\n"
+            "🔎 Se buscan revendedores de likes.\n\n"
+            f"💎 Pedidos de {PEDIDO_GRANDE:,} likes en adelante: mejoramos el precio.\n"
+            "⚡ Entrega automática\n"
+            "🧾 Referencia de cada envío en nuestro canal\n"
+            "🏦 Pago por transferencia\n\n"
+            f"Toca el botón y te contactamos, o escríbenos al {PHONE}.",
+            InlineKeyboardMarkup([
+                [B("📩 Quiero ser revendedor / pedido grande", callback_data="m|rev_solicitar")],
+                [B("💰 Ver precios", callback_data="m|precios")],
+                volver]))
+
+    if accion == "rev_solicitar":
+        menu_kb = InlineKeyboardMarkup([[B("⬅️ Menú", callback_data="m|menu")]])
+        clave = f"rev_{uid}"
+        if cfg(clave, "") == hoy():
+            return await say(ctx, chat_id, "✅ Ya recibimos tu solicitud hoy. Te contactamos pronto.",
+                             reply_markup=menu_kb)
+        u = q.from_user
+        usuario = f"@{u.username}" if u.username else "sin usuario"
+        enviado = False
+        if ADMINS:
+            try:
+                await ctx.bot.send_message(
+                    ADMINS[0],
+                    "🤝 <b>Solicitud de revendedor / pedido grande</b>\n\n"
+                    f"👤 <a href=\"tg://user?id={uid}\">{html.escape(u.first_name or 'Cliente')}</a>\n"
+                    f"🆔 {uid}\n🔗 {html.escape(usuario)}",
+                    parse_mode="HTML")
+                enviado = True
+            except Exception:
+                logging.exception("solicitud revendedor")
+        if not enviado:
+            return await say(ctx, chat_id, f"⚠️ No pudimos enviar tu solicitud. Escríbenos al {PHONE}.",
+                             reply_markup=menu_kb)
+        set_cfg(clave, hoy())
+        return await say(
+            ctx, chat_id,
+            f"✅ ¡Solicitud enviada!\n\nTe contactamos pronto. También puedes escribirnos al {PHONE}.",
+            reply_markup=menu_kb)
 
     if accion in PEDIR:
         tipo, pregunta = PEDIR[accion]
