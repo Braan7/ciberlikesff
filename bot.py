@@ -1,5 +1,6 @@
 import os
 import time
+import hashlib
 import html
 import math
 import secrets
@@ -1983,6 +1984,7 @@ def kb_menu_principal(uid=None):
         [B("🎨 Nick Color Craftland", callback_data="m|craft")],
         [B("🛒 Comprar likes", callback_data="m|comprar"), B("💰 Precios", callback_data="m|precios")],
         [B("💳 Mi cuenta", callback_data="m|cuenta"), B("🎁 Prueba gratis", callback_data="m|prueba")],
+        [B("🏆 Top clientes", callback_data="m|top")],
         [B("🆘 Ayuda y soporte", callback_data="m|ayuda"), B("🤝 Revendedores", callback_data="m|revendedor")],
     ]
     if uid in ADMINS:
@@ -2054,6 +2056,7 @@ def kb_admin():
         [B("🎨 Pedidos Craftland", callback_data="ad|craftpedidos"), B("🤖 Autos activos", callback_data="ad|autolist")],
         [sw("bot_on"), sw("prueba")],
         [sw("free"), sw("unlimited")],
+        [B("🏆 Top clientes (con usuarios)", callback_data="ad|top")],
         [B("🗄️ Backup", callback_data="ad|backup"), B("📑 Historial API", callback_data="ad|historial")],
         [B("ℹ️ Comandos con datos", callback_data="ad|ayuda")],
         [B("⬅️ Menú", callback_data="m|menu")],
@@ -2225,6 +2228,8 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "craftpedidos": craftpedidos_cmd, "autolist": autolist, "backup": backup_cmd,
             "historial": historial,
         }
+        if sub == "top":
+            return await say(ctx, chat_id, texto_top_admin())
         if sub in acciones:
             return await acciones[sub](shim, ctx)
         if sub == "ayuda":
@@ -2280,6 +2285,10 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if accion == "autos":
         texto, kb = vista_autos(uid)
+        return await editar(q, texto, kb)
+
+    if accion in ("top", "top_mes"):
+        texto, kb = vista_top(uid, mes=(accion == "top_mes"))
         return await editar(q, texto, kb)
 
     if accion == "revendedor":
@@ -2388,6 +2397,73 @@ async def texto_libre(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 @solo_admin
 async def admin_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(texto_admin(), reply_markup=kb_admin())
+
+
+# ================== TOP DE CLIENTES (anónimo) ==================
+def alias_cliente(uid):
+    """Nombre anónimo y estable (no revela el @ ni el ID del cliente)."""
+    sal = cfg("top_salt", "")
+    if not sal:
+        sal = secrets.token_hex(8)
+        set_cfg("top_salt", sal)
+    return "Cliente " + hashlib.sha256(f"{sal}:{uid}".encode()).hexdigest()[:4].upper()
+
+
+def top_likes(mes=False):
+    """Likes enviados por cliente (sin admins, sin bloqueados, sin pruebas gratis)."""
+    consulta = ("SELECT user_id, SUM(likes) AS total FROM logs "
+                "WHERE status='success' AND origin IN ('manual','auto')")
+    params = ()
+    if mes:
+        consulta += " AND ts LIKE ?"
+        params = (f"{now():%Y-%m}%",)
+    consulta += " GROUP BY user_id HAVING total > 0 ORDER BY total DESC, user_id"
+    out = []
+    for r in db.execute(consulta, params).fetchall():
+        u = get_user(r["user_id"])
+        if r["user_id"] in ADMINS or (u and (u["banned"] or 0)):
+            continue
+        out.append({"user_id": r["user_id"], "total": r["total"]})
+    return out
+
+
+def vista_top(uid, mes=False, limite=10):
+    B = InlineKeyboardButton
+    ranking = top_likes(mes)
+    medallas = ["🥇", "🥈", "🥉"]
+    titulo = "📅 𝗧𝗢𝗣 𝗗𝗘𝗟 𝗠𝗘𝗦" if mes else "🏆 𝗧𝗢𝗣 𝗖𝗟𝗜𝗘𝗡𝗧𝗘𝗦"
+    texto = (f"╔══════════════╗\n  {titulo}\n╚══════════════╝\n\n"
+             "Likes enviados por cliente\n\n")
+    if not ranking:
+        texto += "📭 Aún no hay envíos este periodo. ¡Sé el primero!\n"
+    for i, r in enumerate(ranking[:limite], 1):
+        marca = medallas[i - 1] if i <= 3 else f"{i}."
+        tu = "  👈 tú" if r["user_id"] == uid else ""
+        texto += f"{marca} {alias_cliente(r['user_id'])} — {r['total']:,} likes{tu}\n"
+    pos = next((i for i, r in enumerate(ranking, 1) if r["user_id"] == uid), None)
+    if pos and pos > limite:
+        texto += f"\n📍 Tu posición: #{pos} — {ranking[pos - 1]['total']:,} likes\n"
+    elif not pos and uid not in ADMINS:
+        texto += "\n📍 Aún no apareces. Envía likes para entrar al ranking.\n"
+    texto += "\n🔒 Los nombres de los clientes son privados."
+    kb = InlineKeyboardMarkup([
+        [B("🏆 Total" if mes else "• 🏆 Total •", callback_data="m|top"),
+         B("• 📅 Este mes •" if mes else "📅 Este mes", callback_data="m|top_mes")],
+        [B("🛒 Comprar likes", callback_data="m|comprar")],
+        [B("⬅️ Menú", callback_data="m|menu")]])
+    return texto, kb
+
+
+def texto_top_admin(limite=15):
+    ranking = top_likes(False)[:limite]
+    if not ranking:
+        return "📭 Aún no hay envíos de clientes."
+    lineas = []
+    for i, r in enumerate(ranking, 1):
+        u = get_user(r["user_id"])
+        nombre = f"@{u['username']}" if u and u["username"] else "sin usuario"
+        lineas.append(f"{i}. {nombre} • 🆔 {r['user_id']} • {r['total']:,} likes")
+    return "🏆 𝗧𝗢𝗣 𝗖𝗟𝗜𝗘𝗡𝗧𝗘𝗦 (solo admin)\n\n" + "\n".join(lineas)
 
 
 def main():
