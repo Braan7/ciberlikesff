@@ -437,7 +437,10 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             db.execute("UPDATE users SET ref_by=? WHERE user_id=?", (ref, u.id))
             db.commit()
     usuario = f"@{u.username}" if u.username else "sin usuario"
-    await update.message.reply_text(
+    await _borrar_menu_anterior(ctx)
+    await _borrar_prompt(ctx)
+    ctx.user_data["nav_pila"], ctx.user_data["nav_actual"] = [], "m|menu"
+    msg = await update.message.reply_text(
         f"👋 ¡Hola, {u.first_name or 'amigo'}! Soy 𝗖𝗜𝗕𝗘𝗥 𝗕𝗢𝗧 ⚡\n\n"
         "👤 𝗧𝗨 𝗣𝗘𝗥𝗙𝗜𝗟\n"
         f"🆔 ID ➜ {u.id}\n"
@@ -450,6 +453,9 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "Elige una opción 👇",
         reply_markup=kb_menu_principal(u.id))
+    if getattr(msg, "message_id", None):
+        ctx.user_data["menu_msg"] = (update.effective_chat.id, msg.message_id)
+    await _borrar_msg(update.message)      # tu "/start" también desaparece
 
 
 async def ayuda(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -626,10 +632,12 @@ async def say(ctx, chat_id, text, **kw):
 
 
 def teclado_resultado(target_id, amount):
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔁 Repetir envío", callback_data=f"rep|{target_id}|{amount}"),
-        InlineKeyboardButton("💳 Mi saldo", callback_data="saldo"),
-    ]])
+    B = InlineKeyboardButton
+    return InlineKeyboardMarkup([
+        [B("🔁 Repetir envío", callback_data=f"rep|{target_id}|{amount}"),
+         B("🆔 Enviar a otro ID", callback_data="m|otro_id")],
+        [B("💳 Mi saldo", callback_data="saldo"), B("🏠 Menú", callback_data="m|menu_nuevo")],
+    ])
 
 
 async def procesar_likes(ctx, uid, chat_id, target_id, amount_arg, confirmado=False):
@@ -706,6 +714,10 @@ async def procesar_likes(ctx, uid, chat_id, target_id, amount_arg, confirmado=Fa
         texto = ficha(d, target_id, region, secs)
         enviada = await enviar_referencia(ctx.bot, texto)
         extra = ""
+        if enviados < amount:
+            extra += (f"\nℹ️ Se enviaron {enviados:,} de {amount:,} likes."
+                      + (f" Los {amount - enviados:,} restantes volvieron a tu saldo." if modo == "creditos" else "")
+                      + "\n   (Suele pasar cuando el ID ya recibió likes hoy.)")
         if modo == "creditos":
             restante = creditos(uid)
             extra += f"\n💳 Créditos restantes: {restante}"
@@ -744,10 +756,7 @@ async def botones(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if partes[0] in ("rep", "ok") and len(partes) == 3 and partes[1].isdigit() and partes[2].isdigit():
         await q.answer()
         if partes[0] == "ok":
-            try:
-                await q.message.edit_reply_markup(reply_markup=None)   # evita doble toque
-            except Exception:
-                pass
+            await _quitar(q.message)   # la pregunta de confirmación desaparece (y evita doble toque)
         return await procesar_likes(ctx, uid, q.message.chat_id, partes[1], int(partes[2]),
                                     confirmado=(partes[0] == "ok"))
     if partes[0] == "pk" and len(partes) == 2 and partes[1].isdigit():
@@ -755,6 +764,7 @@ async def botones(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if likes_n not in PRECIOS_LIKES:
             return await q.answer("Cantidad no válida", show_alert=True)
         await q.answer()
+        await _quitar(q.message)      # la lista de paquetes desaparece
         return await iniciar_compra(ctx, uid, q.message.chat_id, likes_n)
     if partes[0] == "cx" and len(partes) == 2 and partes[1].isdigit():
         cur = db.execute(
@@ -1081,21 +1091,25 @@ ESTADO_CRAFT = {"queued": "⏳ en fila", "processing": "⚙️ enviando", "compl
                 "failed": "❌ no completado", "revisar": "🔎 en revisión"}
 
 
-async def craft_mis_pedidos(ctx, uid, chat_id):
+def texto_mis_pedidos(uid):
     rows = db.execute(
         "SELECT * FROM craft_pedidos WHERE user_id=? ORDER BY id DESC LIMIT 5", (uid,)).fetchall()
     cant = db.execute(
         "SELECT * FROM ordenes WHERE user_id=? AND producto='craft_avulso' AND estado NOT IN "
         "('pendiente','cancelada') ORDER BY id DESC LIMIT 5", (uid,)).fetchall()
     if not rows and not cant:
-        return await say(ctx, chat_id, "📭 Aún no tienes pedidos de Craftland.")
+        return "📭 Aún no tienes pedidos de Craftland."
     lineas = [f"🎨 #{r['code'] or '—'} • 🆔 {r['player_id']} • {ESTADO_CRAFT.get(r['estado'], r['estado'])}"
               for r in rows]
     estados = {"en_revision": "🔎 en revisión", "por_entregar": "📦 enviando", "entregada": "✅ entregado",
                "rechazada": "❌ rechazado", "aprobada": "✅ aprobado"}
     lineas += [f"👥 +{o['likes']:,} • 🆔 {o['player_id']} • {estados.get(o['estado'], o['estado'])}"
                for o in cant]
-    await say(ctx, chat_id, "🎨 𝗠𝗜𝗦 𝗣𝗘𝗗𝗜𝗗𝗢𝗦\n\n" + "\n".join(lineas))
+    return "🎨 𝗠𝗜𝗦 𝗣𝗘𝗗𝗜𝗗𝗢𝗦\n\n" + "\n".join(lineas)
+
+
+async def craft_mis_pedidos(ctx, uid, chat_id):
+    await say(ctx, chat_id, texto_mis_pedidos(uid))
 
 
 @admin_privado
@@ -1133,25 +1147,6 @@ async def craftpedidos_cmd(update, ctx):
 # ================== MENÚ POR BOTONES ==================
 def _creditos_txt(uid):
     return "∞" if uid in ADMINS else f"{creditos(uid):,}"
-
-
-class _Shim:
-    """Permite reutilizar los comandos desde un botón."""
-    def __init__(self, q):
-        self.callback_query = q
-        self.message = q.message
-        self.effective_user = q.from_user
-        self.effective_chat = q.message.chat
-
-
-async def editar(q, texto, kb=None):
-    try:
-        await q.message.edit_text(texto, reply_markup=kb)
-    except Exception:
-        try:
-            await q.message.reply_text(texto, reply_markup=kb)
-        except Exception:
-            pass
 
 
 PEDIR = {}
@@ -1206,7 +1201,9 @@ def texto_pago(oid, likes, monto, producto="likes", player_id=None):
 
 async def iniciar_compra(ctx, uid, chat_id, likes):
     oid, monto = crear_orden(uid, likes)
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar orden", callback_data=f"cx|{oid}")]])
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("↩️ Cambiar paquete", callback_data="m|comprar")],
+        [InlineKeyboardButton("❌ Cancelar orden", callback_data=f"cx|{oid}")]])
     await ctx.bot.send_message(chat_id, texto_pago(oid, likes, monto),
                                parse_mode="HTML", reply_markup=kb)
 
@@ -2193,27 +2190,200 @@ async def cancelar_auto_cliente(ctx, uid, chat_id, target):
               f"saldo: {creditos(uid):,}")
 
 
-async def editar(q, texto, kb=None):
+# ----- Navegación: botón "Regresar", mensajes que se reemplazan y limpieza del chat -----
+def fila_nav():
+    B = InlineKeyboardButton
+    return [B("↩️ Regresar", callback_data="m|back"), B("🏠 Menú", callback_data="m|menu")]
+
+
+def con_nav(kb):
+    """Quita los botones sueltos de 'Volver/Menú' y agrega [↩️ Regresar][🏠 Menú]."""
+    filas, ya = [], False
+    if kb is not None:
+        for fila in kb.inline_keyboard:
+            if all((b.text or "").startswith("⬅️") for b in fila):
+                continue
+            if any(getattr(b, "callback_data", None) == "m|back" for b in fila):
+                ya = True
+            filas.append(list(fila))
+    if not ya:
+        filas.append(fila_nav())
+    return InlineKeyboardMarkup(filas)
+
+
+async def editar(q, texto, kb=None, nav=True):
+    """Reemplaza el mensaje del botón (el anterior desaparece) y agrega Regresar/Menú."""
+    kb2 = con_nav(kb) if (nav and kb is not None) else kb
     try:
-        await q.message.edit_text(texto, reply_markup=kb)
+        return await q.message.edit_text(texto, reply_markup=kb2)
+    except Exception as e:
+        if "not modified" in str(e).lower():
+            return q.message
+        try:
+            return await q.message.reply_text(texto, reply_markup=kb2)
+        except Exception:
+            return None
+
+
+async def _borrar_msg(msg):
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+
+async def _quitar(msg):
+    """Hace desaparecer un mensaje con botones; si no se puede borrar, al menos le quita los botones."""
+    try:
+        await msg.delete()
     except Exception:
         try:
-            await q.message.reply_text(texto, reply_markup=kb)
+            await msg.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
 
 
+def _guardar_prompt(ctx, chat_id, msg):
+    mid = getattr(msg, "message_id", None)
+    if mid:
+        ctx.user_data["prompt"] = (chat_id, mid)
+
+
+async def _borrar_prompt(ctx):
+    prev = ctx.user_data.pop("prompt", None)
+    if prev:
+        try:
+            await ctx.bot.delete_message(prev[0], prev[1])
+        except Exception:
+            pass
+
+
+async def _soltar_prompt(ctx, q):
+    """Olvida la pregunta pendiente; la borra salvo que sea el mismo mensaje donde se pulsó el botón."""
+    prev = ctx.user_data.pop("prompt", None)
+    if prev and prev[1] != getattr(q.message, "message_id", None):
+        try:
+            await ctx.bot.delete_message(prev[0], prev[1])
+        except Exception:
+            pass
+
+
+async def _limpiar_entrada(ctx, m, prompt=True):
+    """Borra lo que escribió el cliente (ID, cantidad...) y la pregunta del bot."""
+    await _borrar_msg(m)
+    if prompt:
+        await _borrar_prompt(ctx)
+
+
+async def _borrar_menu_anterior(ctx):
+    prev = ctx.user_data.pop("menu_msg", None)
+    if prev:
+        try:
+            await ctx.bot.delete_message(prev[0], prev[1])
+        except Exception:
+            pass
+
+
+PANTALLAS_NAV = {
+    "likes", "craft", "cuenta", "autos", "craft_seg", "top", "top_mes", "comprar", "precios", "ayuda",
+    "revendedor", "mov", "ref", "status", "craft_pedidos", "compras",
+    "likes_enviar", "prueba", "jugador", "craft_comprar", "canjear", "auto_nuevo", "cs_otra", "soporte",
+}
+
+
+def _nav_ir(ctx, destino):
+    """Apunta la pantalla actual y guarda la anterior para el botón Regresar."""
+    ud = ctx.user_data
+    if destino == "m|menu":
+        ud["nav_pila"], ud["nav_actual"] = [], "m|menu"
+        return
+    pila = ud.setdefault("nav_pila", [])
+    actual = ud.get("nav_actual")
+    if actual and actual != destino:
+        pila.append(actual)
+        del pila[:-12]
+    ud["nav_actual"] = destino
+
+
+def ids_recientes(uid, n=3):
+    rows = db.execute(
+        "SELECT target_id FROM logs WHERE user_id=? AND status='success' AND origin='manual' "
+        "GROUP BY target_id ORDER BY MAX(id) DESC LIMIT ?", (uid, n)).fetchall()
+    return [r["target_id"] for r in rows]
+
+
+def filas_ids_recientes(uid):
+    ids = ids_recientes(uid)
+    if not ids:
+        return []
+    return [[InlineKeyboardButton(f"🆔 {t}", callback_data=f"lk|{t}") for t in ids]]
+
+
+class _MsgEditable:
+    """Hace que reply_text EDITE el mensaje del botón en vez de mandar uno nuevo debajo."""
+    def __init__(self, q):
+        self._q = q
+        self.chat = q.message.chat
+        self.chat_id = q.message.chat_id
+
+    async def reply_text(self, texto, reply_markup=None, **kw):
+        kb = con_nav(reply_markup)
+        try:
+            return await self._q.message.edit_text(texto, reply_markup=kb, **kw)
+        except Exception as e:
+            if "not modified" in str(e).lower():
+                return self._q.message
+            try:
+                return await self._q.message.reply_text(texto, reply_markup=kb, **kw)
+            except Exception:
+                return None
+
+
 class _Shim:
     """Permite reutilizar las funciones desde un botón."""
-    def __init__(self, q):
+    def __init__(self, q, editable=False):
         self.callback_query = q
-        self.message = q.message
+        self.message = _MsgEditable(q) if editable else q.message
         self.effective_user = q.from_user
         self.effective_chat = q.message.chat
 
 
+class _QProxy:
+    """Hace pasar otro callback_data por el mismo mensaje (lo usa 'Regresar')."""
+    def __init__(self, q, data):
+        self._q = q
+        self.data = data
+        self.from_user = q.from_user
+        self.message = q.message
+
+    async def answer(self, *a, **k):
+        return None
+
+
+def texto_mis_compras(uid):
+    rows = db.execute(
+        "SELECT * FROM ordenes WHERE user_id=? AND estado!='cancelada' ORDER BY id DESC LIMIT 8", (uid,)).fetchall()
+    if not rows:
+        return "📭 Aún no tienes compras.\n\nElige un paquete en 🛒 Comprar likes."
+    est = {"pendiente": "🕓 esperando comprobante", "en_revision": "🔎 en revisión", "aprobada": "✅ acreditada",
+           "rechazada": "❌ rechazada", "por_entregar": "📦 enviando", "entregada": "✅ entregada"}
+    lineas = []
+    for o in rows:
+        if o["producto"] == "craft":
+            que = f"🎨 Nick Color • ID {o['player_id']}"
+        elif o["producto"] == "craft_avulso":
+            que = f"👥 +{o['likes']:,} seguidores • ID {o['player_id']}"
+        else:
+            que = f"❤️ {o['likes']:,} likes"
+        lineas.append(f"#{o['id']} • {que} • ${_fmt(o['monto'])} MXN • {est.get(o['estado'], o['estado'])}")
+    return "🧾 𝗠𝗜𝗦 𝗖𝗢𝗠𝗣𝗥𝗔𝗦\n\n" + "\n".join(lineas)
+
+
 async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
+    await _manejar(ctx, update.callback_query)
+
+
+async def _manejar(ctx, q):
     uid = q.from_user.id
     chat_id = q.message.chat_id
     partes = (q.data or "").split("|")
@@ -2223,8 +2393,20 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     shim = _Shim(q)
     ctx.args = []
 
-    # ----- Likes: cantidad elegida -----
+    # ----- Likes: ID elegido de la lista de recientes -----
+    if partes[0] == "lk" and len(partes) == 2 and partes[1].isdigit():
+        tope = limite_envio(uid)
+        if tope <= 0:
+            return await say(ctx, chat_id, SIN_ACCESO)
+        ctx.user_data["likes_id"] = partes[1]
+        ctx.user_data.pop("esperando", None)
+        ctx.user_data.pop("prompt", None)
+        return await editar(q, f"❤️ ID {partes[1]}\n{_saldo_linea(uid)}¿Cuántos likes quieres enviar?",
+                            teclado_cantidades(partes[1], tope))
+
+    # ----- Likes: cantidad elegida (el selector de cantidad desaparece) -----
     if partes[0] == "lk" and len(partes) == 3 and partes[1].isdigit() and partes[2].isdigit():
+        await _quitar(q.message)
         return await procesar_likes(ctx, uid, chat_id, partes[1], int(partes[2]))
 
     # ----- Admin: responder a un cliente por el bot -----
@@ -2245,16 +2427,13 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             precio = precio_seguidores(n)
             if precio is None:
                 return
-            return await pedir_id_seguidores(ctx, chat_id, n)
+            return await pedir_id_seguidores(ctx, chat_id, n, q=q)
         if len(partes) == 4 and partes[1] == "ok" and partes[2].isdigit() and partes[3].isdigit():
             n = int(partes[3])
             precio = precio_seguidores(n)
             if precio is None:
                 return
-            try:
-                await q.message.edit_reply_markup(reply_markup=None)
-            except Exception:
-                pass
+            await _quitar(q.message)
             oid, monto = crear_orden(uid, n, "craft_avulso", partes[2], precio)
             kb = InlineKeyboardMarkup([[B("❌ Cancelar orden", callback_data=f"cx|{oid}")]])
             return await ctx.bot.send_message(
@@ -2292,10 +2471,7 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ----- Craftland: continuar -----
     if partes[0] == "ct":
         if partes[1:2] == ["ok"] and len(partes) == 3 and partes[2].isdigit():
-            try:
-                await q.message.edit_reply_markup(reply_markup=None)
-            except Exception:
-                pass
+            await _quitar(q.message)
             if uid in ADMINS:
                 ok, res = await craft_crear_en_proveedor(ctx.bot, uid, chat_id, partes[2])
                 return await say(ctx, chat_id, f"✅ Pedido creado #{res}" if ok else f"⚠️ {res}")
@@ -2328,10 +2504,7 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     "↩️ Lo que no se envíe se te devuelve.",
                     InlineKeyboardMarkup([[B("✅ Confirmar", callback_data=f"au|ok|{tid}|{dias}|{cant}"),
                                            B("❌ Cancelar", callback_data="m|autos")]]))
-            try:
-                await q.message.edit_reply_markup(reply_markup=None)
-            except Exception:
-                pass
+            await _quitar(q.message)
             return await crear_auto_cliente(ctx, uid, chat_id, tid, dias, cant)
         if sub == "x" and len(partes) == 3 and partes[2].isdigit():
             return await cancelar_auto_cliente(ctx, uid, chat_id, partes[2])
@@ -2343,11 +2516,13 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         sub = partes[1] if len(partes) > 1 else "panel"
         if sub == "panel":
+            _nav_ir(ctx, "ad|panel")
             return await editar(q, texto_admin(), kb_admin())
         if sub == "t" and len(partes) == 3 and partes[2] in TOGGLES:
             clave = partes[2]
             nuevo = "0" if cfg(clave, TOGGLES[clave][1]) == "1" else "1"
             set_cfg(clave, nuevo)
+            _nav_ir(ctx, "ad|panel")
             return await editar(q, texto_admin(), kb_admin())
         acciones = {
             "stats": stats, "reporte": reporte_cmd, "ordenes": ordenes_cmd, "logs": logs_cmd,
@@ -2368,9 +2543,37 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ----- Navegación -----
     accion = partes[1] if len(partes) > 1 else "menu"
+    if accion == "back":
+        ctx.user_data.pop("esperando", None)
+        await _soltar_prompt(ctx, q)
+        pila = ctx.user_data.get("nav_pila") or []
+        destino = pila.pop() if pila else "m|menu"
+        ctx.user_data["nav_actual"] = destino
+        return await _manejar(ctx, _QProxy(q, destino))
     if accion in ("menu", "cancel"):
         ctx.user_data.pop("esperando", None)
-        return await editar(q, texto_menu(uid), kb_menu_principal(uid))
+        await _soltar_prompt(ctx, q)
+        _nav_ir(ctx, "m|menu")
+        return await editar(q, texto_menu(uid), kb_menu_principal(uid), nav=False)
+    if accion == "menu_nuevo":          # desde el resultado de un envío: el comprobante se queda
+        await _borrar_menu_anterior(ctx)
+        _nav_ir(ctx, "m|menu")
+        msg = await say(ctx, chat_id, texto_menu(uid), reply_markup=kb_menu_principal(uid))
+        if getattr(msg, "message_id", None):
+            ctx.user_data["menu_msg"] = (chat_id, msg.message_id)
+        return
+    if accion == "otro_id":             # enviar likes a otro ID sin perder el resultado anterior
+        tope = limite_envio(uid)
+        if tope <= 0:
+            return await say(ctx, chat_id, SIN_ACCESO)
+        await _borrar_prompt(ctx)
+        ctx.user_data["esperando"] = ("likes_id", time.time())
+        msg = await say(ctx, chat_id, "🆔 Envía el ID de Free Fire al que quieres enviar likes (solo números):",
+                        reply_markup=con_nav(InlineKeyboardMarkup(filas_ids_recientes(uid))))
+        _guardar_prompt(ctx, chat_id, msg)
+        return
+    if accion in PANTALLAS_NAV:
+        _nav_ir(ctx, f"m|{accion}")
 
     if accion == "likes":
         return await editar(
@@ -2412,7 +2615,7 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardMarkup([
                 [B("📜 Movimientos", callback_data="m|mov"), B("👥 Invitar amigos", callback_data="m|ref")],
                 [B("🎟 Canjear código", callback_data="m|canjear"), B("📊 Mi estado", callback_data="m|status")],
-                [B("🛒 Comprar likes", callback_data="m|comprar")],
+                [B("🧾 Mis compras", callback_data="m|compras"), B("🛒 Comprar likes", callback_data="m|comprar")],
                 volver]))
 
     if accion == "likes_otra":
@@ -2422,11 +2625,11 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if tope <= 0:
             return await say(ctx, chat_id, SIN_ACCESO)
         ctx.user_data["esperando"] = ("likes_cant", time.time())
-        return await say(
-            ctx, chat_id,
-            f"✏️ Escribe cuántos likes quieres enviar al ID {ctx.user_data['likes_id']}.\n"
-            f"Puedes enviar de 1 a {tope:,}.",
-            reply_markup=InlineKeyboardMarkup([[B("❌ Cancelar", callback_data="m|cancel")]]))
+        msg = await editar(
+            q, f"✏️ Escribe cuántos likes quieres enviar al ID {ctx.user_data['likes_id']}.\n"
+               f"Puedes enviar de 1 a {tope:,}.", InlineKeyboardMarkup([]))
+        _guardar_prompt(ctx, chat_id, msg or q.message)
+        return msg
 
     if accion == "craft_seg":
         filas, fila = [], []
@@ -2507,15 +2710,20 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if accion in PEDIR:
         tipo, pregunta = PEDIR[accion]
         ctx.user_data["esperando"] = (tipo, time.time())
-        return await say(ctx, chat_id, pregunta,
-                         reply_markup=InlineKeyboardMarkup([[B("❌ Cancelar", callback_data="m|cancel")]]))
+        filas = filas_ids_recientes(uid) if accion == "likes_enviar" else []
+        msg = await editar(q, pregunta, InlineKeyboardMarkup(filas))
+        _guardar_prompt(ctx, chat_id, msg or q.message)
+        return msg
 
     simples = {"comprar": comprar, "ayuda": ayuda, "mov": movimientos, "ref": referidos,
                "precios": precios, "status": status}
     if accion in simples:
-        return await simples[accion](shim, ctx)
+        return await simples[accion](_Shim(q, editable=True), ctx)
     if accion == "craft_pedidos":
-        return await craft_mis_pedidos(ctx, uid, chat_id)
+        return await editar(q, texto_mis_pedidos(uid), InlineKeyboardMarkup([]))
+    if accion == "compras":
+        return await editar(q, texto_mis_compras(uid),
+                            InlineKeyboardMarkup([[B("🛒 Comprar likes", callback_data="m|comprar")]]))
 
 
 async def texto_libre(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2559,7 +2767,9 @@ async def texto_libre(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                      + (f" (tienes {creditos(uid):,} créditos)." if uid not in ADMINS else "."))
         if error:
             ctx.user_data["esperando"] = ("likes_cant", time.time())
-            return await m.reply_text(error + "\nEscribe otra cantidad o toca ❌ Cancelar.")
+            await _borrar_msg(m)
+            return await m.reply_text(error + "\nEscribe otra cantidad o toca ↩️ Regresar.")
+        await _limpiar_entrada(ctx, m)
         return await procesar_likes(ctx, uid, update.effective_chat.id, target, n)
 
     # Seguidores por cantidad: cantidad personalizada
@@ -2570,9 +2780,11 @@ async def texto_libre(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         precio = precio_seguidores(n)
         if precio is None:
             ctx.user_data["esperando"] = ("cs_cant", time.time())
+            await _borrar_msg(m)
             return await m.reply_text(
                 f"❌ La cantidad debe ser de {SEG_MIN:,} a {SEG_MAX:,}, en múltiplos de 1,000.\n"
                 "Ejemplo: 15000")
+        await _limpiar_entrada(ctx, m)
         return await pedir_id_seguidores(ctx, update.effective_chat.id, n)
 
     # Seguidores por cantidad: Player ID a verificar
@@ -2582,6 +2794,7 @@ async def texto_libre(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not n:
             return await m.reply_text("⏳ Se venció la solicitud. Elige la cantidad otra vez desde el menú.",
                                       reply_markup=kb_menu_principal(uid))
+        await _limpiar_entrada(ctx, m)
         return await craft_seg_preview(ctx, uid, update.effective_chat.id, txt, n)
 
     # El cliente le escribe a soporte
@@ -2628,8 +2841,10 @@ async def texto_libre(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[B("💬 Seguir respondiendo", callback_data=f"rp|{destino}")]]))
 
     if tipo != "canjear" and not txt.isdigit():
-        return await m.reply_text("❌ Envía solo el ID, con números. (O toca ❌ Cancelar)")
+        await _borrar_msg(m)
+        return await m.reply_text("❌ Envía solo el ID, con números. (O toca ↩️ Regresar)")
     ctx.user_data.pop("esperando", None)
+    await _limpiar_entrada(ctx, m)
     chat_id = update.effective_chat.id
 
     if tipo == "likes_id":
@@ -2762,14 +2977,16 @@ def precio_seguidores(n):
     return None
 
 
-async def pedir_id_seguidores(ctx, chat_id, n):
+async def pedir_id_seguidores(ctx, chat_id, n, q=None):
     ctx.user_data["cs_cant"] = n
     ctx.user_data["esperando"] = ("cs_id", time.time())
-    await say(
-        ctx, chat_id,
-        f"👥 +{n:,} seguidores • ${precio_seguidores(n)} MXN\n\n"
-        "Envía el Player ID de Free Fire (solo números) para verificar que puede recibirlos:",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="m|cancel")]]))
+    texto = (f"👥 +{n:,} seguidores • ${precio_seguidores(n)} MXN\n\n"
+             "Envía el Player ID de Free Fire (solo números) para verificar que puede recibirlos:")
+    if q is not None:
+        msg = await editar(q, texto, InlineKeyboardMarkup([]))
+    else:
+        msg = await say(ctx, chat_id, texto, reply_markup=con_nav(InlineKeyboardMarkup([])))
+    _guardar_prompt(ctx, chat_id, msg or (q.message if q is not None else None))
 
 
 async def craft_seg_preview(ctx, uid, chat_id, player_id, n):
@@ -2853,7 +3070,7 @@ def teclado_cantidades(target, tope):
         botones.append(B(f"💯 Todo ({tope:,})", callback_data=f"lk|{target}|{tope}"))
     filas = [botones[i:i + 2] for i in range(0, len(botones), 2)]
     filas.append([B("✏️ Otra cantidad", callback_data="m|likes_otra")])
-    filas.append([B("⬅️ Menú", callback_data="m|menu")])
+    filas.append(fila_nav())
     return InlineKeyboardMarkup(filas)
 
 
