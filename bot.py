@@ -63,6 +63,8 @@ PRECIOS_LIKES = {
 PAQUETES = list(PRECIOS_LIKES)
 CRAFT_PRECIO_MXN = 300    # precio del Nick Color Craftland (pago por transferencia)
 PEDIDO_GRANDE = 10000     # desde esta cantidad de likes se ofrece precio especial / revendedores
+SALDO_MIN, SALDO_MAX = 50, 20000          # recarga mínima y máxima del saldo en pesos (MXN)
+RECARGAS_RAPIDAS = [100, 200, 300, 500, 1000, 2000]   # botones de recarga rápida
 
 # ----- Nick Color Craftland (API del proveedor de Craftland) -----
 CRAFT_BASE = "https://lunexiscraft.squareweb.app"
@@ -126,12 +128,16 @@ CREATE TABLE IF NOT EXISTS craft_pedidos(
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, user_id INTEGER, chat_id INTEGER,
     player_id TEXT, creditos INTEGER, cobrado INTEGER, code TEXT, estado TEXT,
     f_antes INTEGER, f_despues INTEGER, alertado INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS movimientos_mxn(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, user_id INTEGER,
+    delta_c INTEGER, tipo TEXT, nota TEXT, saldo_c INTEGER);
 """)
 for _tabla, _col in [
     ("users", "banned INTEGER DEFAULT 0"), ("users", "ref_by INTEGER"),
     ("users", "ref_paid INTEGER DEFAULT 0"), ("users", "created TEXT"),
     ("users", "prueba_usada INTEGER DEFAULT 0"), ("autos", "owner_id INTEGER"), ("autos", "restantes INTEGER"),
     ("ordenes", "producto TEXT"), ("ordenes", "player_id TEXT"), ("craft_pedidos", "orden_id INTEGER"),
+    ("users", "saldo_mxn_c INTEGER DEFAULT 0"), ("ordenes", "metodo TEXT"), ("craft_pedidos", "pago_c INTEGER"),
 ]:
     try:
         db.execute(f"ALTER TABLE {_tabla} ADD COLUMN {_col}")
@@ -445,7 +451,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "👤 𝗧𝗨 𝗣𝗘𝗥𝗙𝗜𝗟\n"
         f"🆔 ID ➜ {u.id}\n"
         f"👤 Usuario ➜ {usuario}\n"
-        f"💳 Créditos ➜ {_creditos_txt(u.id)}\n\n"
+        f"💳 Créditos ➜ {_creditos_txt(u.id)}\n"
+        f"💵 Saldo MXN ➜ {fmt_mxn(saldo_mxn(u.id))}\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "❤️ Likes para Free Fire\n"
         "🎨 Nick Color Craftland\n"
@@ -598,6 +605,7 @@ async def buscar(update, ctx):
     t = (
         f"🔎 {nombre} • 🆔 {uid}\n"
         f"💳 Créditos: {r['credits'] or 0}\n"
+        f"💵 Saldo MXN: {fmt_mxn(r['saldo_mxn_c'] or 0)}\n"
         f"🚫 Bloqueado: {'sí' if r['banned'] else 'no'}\n"
         f"📅 Primer uso: {(r['created'] or '—')[:16].replace('T', ' ')}\n"
         f"👥 Invitado por: {r['ref_by'] or '—'}\n"
@@ -862,7 +870,7 @@ def _pedido_activo(player_id):
 
 
 async def craft_preview(ctx, uid, chat_id, player_id):
-    """Muestra los datos del jugador y pide confirmación antes de pasar al pago."""
+    """Muestra los datos del jugador y deja elegir cómo pagar (saldo o transferencia)."""
     es_adm = uid in ADMINS
     if not CRAFT_KEY:
         return await say(ctx, chat_id, "🎨 Este servicio no está disponible por ahora.")
@@ -889,12 +897,22 @@ async def craft_preview(ctx, uid, chat_id, player_id):
     nick = pick(d, "nickname", "nick", "apelido", "player_nickname", default="N/D")
     region = pick(d, "region", "regiao", default="N/D")
     seg = pick(d, "followers", "seguidores")
-    costo = "Gratis (admin)" if es_adm else f"${CRAFT_PRECIO_MXN} MXN"
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Crear pedido" if es_adm else "💳 Continuar al pago",
-                             callback_data=f"ct|ok|{player_id}"),
-        InlineKeyboardButton("❌ Cancelar", callback_data="ct|no"),
-    ]])
+    B = InlineKeyboardButton
+    precio_c = CRAFT_PRECIO_MXN * 100
+    filas, saldo_txt = [], ""
+    if es_adm:
+        costo = "Gratis (admin)"
+        filas.append([B("✅ Crear pedido", callback_data=f"ct|ok|{player_id}")])
+    else:
+        costo = f"${CRAFT_PRECIO_MXN} MXN"
+        saldo = saldo_mxn(uid)
+        saldo_txt = f"↬ Tu saldo: {fmt_mxn(saldo)}\n"
+        if saldo >= precio_c:
+            filas.append([B(f"💵 Pagar con mi saldo ({fmt_mxn(saldo)})", callback_data=f"cw|p|{player_id}")])
+        filas.append([B("🏦 Pagar por transferencia", callback_data=f"ct|ok|{player_id}")])
+        if saldo < precio_c:
+            filas.append([B("💵 Recargar saldo", callback_data="m|recargar")])
+    filas.append([B("❌ Cancelar", callback_data="ct|no")])
     await say(
         ctx, chat_id,
         "🎨 NICK COLOR CRAFTLAND\n"
@@ -906,12 +924,13 @@ async def craft_preview(ctx, uid, chat_id, player_id):
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"↬ Pack: Nivel 6 • +{CRAFT_SEGUIDORES:,} seguidores\n"
         f"↬ Precio: {costo}\n"
+        f"{saldo_txt}"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "¿Es tu cuenta? Confirma para continuar.",
-        reply_markup=kb)
+        "¿Es tu cuenta? Elige cómo pagar.",
+        reply_markup=InlineKeyboardMarkup(filas))
 
 
-async def craft_crear_en_proveedor(bot, uid, chat_id, player_id, orden_id=None):
+async def craft_crear_en_proveedor(bot, uid, chat_id, player_id, orden_id=None, pago_c=None):
     """Crea el pedido en el proveedor. Devuelve (True, código) o (False, texto de error)."""
     if not CRAFT_KEY:
         return False, "Falta la variable CRAFT_API_KEY."
@@ -930,11 +949,11 @@ async def craft_crear_en_proveedor(bot, uid, chat_id, player_id, orden_id=None):
         return False, craft_error(code, d)
     codigo = pick(d, "code", "order_code", "order_id", "id")
     db.execute(
-        "INSERT INTO craft_pedidos(ts,user_id,chat_id,player_id,creditos,cobrado,code,estado,orden_id) "
-        "VALUES(?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO craft_pedidos(ts,user_id,chat_id,player_id,creditos,cobrado,code,estado,orden_id,pago_c) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?)",
         (now().isoformat(timespec="seconds"), uid, chat_id, player_id, 0, 0,
          str(codigo) if codigo is not None else None,
-         "queued" if codigo is not None else "revisar", orden_id))
+         "queued" if codigo is not None else "revisar", orden_id, pago_c))
     db.commit()
     if codigo is None:
         await avisar_admin(
@@ -1005,7 +1024,11 @@ async def craft_finalizar(bot, r, d, ok):
             logging.exception("craft aviso entrega")
         return
     texto = f"❌ Tu pedido #{r['code']} no pudo completarse."
-    if r["cobrado"]:
+    if r["pago_c"]:
+        devolver_mxn(r["user_id"], r["pago_c"], f"Craftland no completado #{r['code']}")
+        texto += (f"\n💵 Se devolvieron {fmt_mxn(r['pago_c'])} a tu saldo "
+                  f"(saldo: {fmt_mxn(saldo_mxn(r['user_id']))}).")
+    elif r["cobrado"]:
         devolver(r["user_id"], r["creditos"], f"Craftland no completado #{r['code']}")
         texto += f"\n💳 Se devolvieron {r['creditos']:,} créditos a tu cuenta."
     elif r["orden_id"]:
@@ -1176,6 +1199,9 @@ def texto_pago(oid, likes, monto, producto="likes", player_id=None):
     if producto == "craft":
         compra = ("🎨 Compra: <b>Nick Color Craftland</b>\n"
                   f"🆔 Player ID: <b>{e(str(player_id))}</b>\n")
+    elif producto == "saldo":
+        compra = ("💵 Recarga de saldo en pesos\n"
+                  "(se acredita a tu saldo para pagar Craftland al instante)\n")
     elif producto == "craft_avulso":
         compra = (f"👥 Compra: <b>+{likes:,} seguidores Craftland</b>\n"
                   f"🆔 Player ID: <b>{e(str(player_id))}</b>\n")
@@ -1270,6 +1296,8 @@ async def recibir_comprobante(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     nombre = f"@{u.username}" if u.username else (u.first_name or "sin usuario")
     if o["producto"] == "craft":
         detalle = f"🎨 Nick Color Craftland • ID {o['player_id']}"
+    elif o["producto"] == "saldo":
+        detalle = "💵 Recarga de saldo MXN"
     elif o["producto"] == "craft_avulso":
         detalle = f"👥 +{o['likes']:,} seguidores Craftland • ID {o['player_id']}"
     else:
@@ -1321,6 +1349,18 @@ async def aplicar_decision(bot, admin_id, admin_tag, oid, accion):
         return False, f"Esa orden ya está: {o['estado']}."
     cliente = o["user_id"]
     if accion == "apr":
+        if o["producto"] == "saldo":
+            c = int(round((o["monto"] or 0) * 100))
+            acreditar_mxn(cliente, c, "recarga", f"orden #{oid} transferencia")
+            try:
+                await bot.send_message(
+                    cliente,
+                    f"🎉 ¡Pago aprobado!\n\n💵 Se acreditaron {fmt_mxn(c)} MXN a tu saldo\n"
+                    f"💵 Saldo: {fmt_mxn(saldo_mxn(cliente))}\n\n"
+                    f"Ya puedes pagar en 🎨 Nick Color Craftland con tu saldo.\n\n{BRAND}")
+            except Exception:
+                pass
+            return True, f"✅ APROBADA por {admin_tag} • saldo acreditado"
         if o["producto"] == "craft_avulso":
             db.execute("UPDATE ordenes SET estado='por_entregar' WHERE id=?", (oid,))
             db.commit()
@@ -1420,7 +1460,7 @@ async def ordenes_cmd(update, ctx):
         return await update.message.reply_text("📭 Aún no hay órdenes.")
     est = {"pendiente": "🕓 esperando comprobante", "en_revision": "🔎 en revisión",
            "aprobada": "✅ aprobada", "rechazada": "❌ rechazada", "cancelada": "🚫 cancelada",
-           "por_entregar": "📦 por entregar", "entregada": "✅ entregada"}
+           "por_entregar": "📦 por entregar", "entregada": "✅ entregada", "devuelta": "↩️ devuelta"}
     rev = sum(1 for r in rows if r["estado"] == "en_revision")
     lineas = [
         f"#{r['id']} • 🆔 {r['user_id']} • {r['likes']:,} • ${_fmt(r['monto'])} • "
@@ -1643,6 +1683,7 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🆔 𝗜𝗗 ➜ {u.id}\n"
         f"🏷️ 𝗥𝗢𝗟 ➜ {rol}\n"
         f"💳 𝗖𝗥𝗘́𝗗𝗜𝗧𝗢𝗦 ➜ {'∞' if u.id in ADMINS else creditos(u.id)}\n"
+        f"💵 𝗦𝗔𝗟𝗗𝗢 𝗠𝗫𝗡 ➜ {fmt_mxn(saldo_mxn(u.id))}\n"
         f"🎁 𝗨𝗦𝗢𝗦 𝗚𝗥𝗔𝗧𝗜𝗦 𝗛𝗢𝗬 ➜ {usos_hoy(r)}/{FREE_DAILY}\n\n"
         f"🔌 Bot: {'🟢 ON' if cfg('bot_on', '1') == '1' else '🔴 OFF'}\n"
         f"🎁 Modo gratis: {'ON' if cfg('free') == '1' else 'OFF'}\n"
@@ -1757,11 +1798,12 @@ async def autoday(update, ctx):
 @admin_privado
 async def usersvip(update, ctx):
     rows = db.execute(
-        "SELECT * FROM users WHERE credits > 0 ORDER BY credits DESC LIMIT 40").fetchall()
+        "SELECT * FROM users WHERE credits > 0 OR COALESCE(saldo_mxn_c,0) > 0 "
+        "ORDER BY credits DESC, saldo_mxn_c DESC LIMIT 40").fetchall()
     if not rows:
         return await update.message.reply_text("📭 No hay clientes con créditos.")
     lines = [
-        f"👤 {('@' + r['username']) if r['username'] else r['user_id']} • 💳 {r['credits']}"
+        f"👤 {('@' + r['username']) if r['username'] else r['user_id']} • 💳 {r['credits'] or 0} • 💵 {fmt_mxn(r['saldo_mxn_c'] or 0)}"
         for r in rows]
     await update.message.reply_text("👥 𝗖𝗟𝗜𝗘𝗡𝗧𝗘𝗦 𝗖𝗢𝗡 𝗖𝗥𝗘́𝗗𝗜𝗧𝗢𝗦\n\n" + "\n".join(lines))
 
@@ -1798,6 +1840,7 @@ async def stats(update, ctx):
         f"👥 𝗨𝗦𝗨𝗔𝗥𝗜𝗢𝗦 ➜ {users}\n"
         f"💳 𝗖𝗟𝗜𝗘𝗡𝗧𝗘𝗦 𝗖𝗢𝗡 𝗦𝗔𝗟𝗗𝗢 ➜ {clientes}\n"
         f"🧮 𝗖𝗥𝗘́𝗗𝗜𝗧𝗢𝗦 𝗣𝗘𝗡𝗗𝗜𝗘𝗡𝗧𝗘𝗦 ➜ {pend}\n"
+        f"💵 𝗦𝗔𝗟𝗗𝗢 𝗠𝗫𝗡 𝗣𝗘𝗡𝗗𝗜𝗘𝗡𝗧𝗘 ➜ {fmt_mxn(total_saldo_mxn_c())}\n"
         f"🤖 𝗔𝗨𝗧𝗢𝗦 ➜ {autos}\n\n{BRAND}")
 
 
@@ -1968,6 +2011,8 @@ async def texto_reporte():
         f"🆕 𝗨𝗦𝗨𝗔𝗥𝗜𝗢𝗦 𝗡𝗨𝗘𝗩𝗢𝗦 ➜ {nuevos}\n"
         f"👥 𝗖𝗟𝗜𝗘𝗡𝗧𝗘𝗦 𝗖𝗢𝗡 𝗦𝗔𝗟𝗗𝗢 ➜ {clientes}\n"
         f"🧮 𝗖𝗥𝗘́𝗗𝗜𝗧𝗢𝗦 𝗣𝗘𝗡𝗗𝗜𝗘𝗡𝗧𝗘𝗦 ➜ {pend}\n"
+        f"💵 𝗥𝗘𝗖𝗔𝗥𝗚𝗔𝗦 𝗠𝗫𝗡 𝗛𝗢𝗬 ➜ {fmt_mxn(recargas_mxn_hoy())}\n"
+        f"💵 𝗦𝗔𝗟𝗗𝗢 𝗠𝗫𝗡 𝗣𝗘𝗡𝗗𝗜𝗘𝗡𝗧𝗘 ➜ {fmt_mxn(total_saldo_mxn_c())}\n"
         f"💳 𝗦𝗔𝗟𝗗𝗢 𝗔𝗣𝗜 ➜ {api_saldo}"
     )
 
@@ -2028,10 +2073,6 @@ async def post_init(app):
 
 # ================== MAIN ==================
 # ================== MENÚ POR BOTONES ==================
-def _creditos_txt(uid):
-    return "∞" if uid in ADMINS else f"{creditos(uid):,}"
-
-
 def kb_menu_principal(uid=None):
     B = InlineKeyboardButton
     filas = [
@@ -2052,7 +2093,8 @@ def texto_menu(uid):
         "╔══════════════╗\n"
         "  🤖 𝗖𝗜𝗕𝗘𝗥 𝗕𝗢𝗧 • 𝗠𝗘𝗡𝗨́\n"
         "╚══════════════╝\n\n"
-        f"💳 Tus créditos: {_creditos_txt(uid)}  (1 crédito = 1 like)\n\n"
+        f"💳 Tus créditos: {_creditos_txt(uid)}  (1 crédito = 1 like)\n"
+        f"💵 Saldo MXN: {fmt_mxn(saldo_mxn(uid))}\n\n"
         "Elige una opción 👇")
 
 
@@ -2064,6 +2106,7 @@ PEDIR = {
     "canjear": ("canjear", "🎟 Envía tu código de recarga:"),
     "auto_nuevo": ("auto_id", "🤖 Envía el ID de Free Fire que recibirá los likes cada día (solo números):"),
     "cs_otra": ("cs_cant", f"✏️ Escribe cuántos seguidores quieres (múltiplos de 1,000, de {SEG_MIN:,} a {SEG_MAX:,}):"),
+    "rc_otra": ("rc_cant", f"✏️ Escribe cuánto quieres recargar en pesos (de ${SALDO_MIN} a ${SALDO_MAX:,}, sin centavos):"),
     "soporte": ("soporte", "💬 Escribe tu mensaje para soporte (solo texto) y lo enviamos. Te respondemos por aquí mismo."),
 }
 
@@ -2089,6 +2132,8 @@ ADMIN_AYUDA = (
     "/autoday <días> <ID> [cantidad] — Auto con tu saldo\n"
     "/autoremove <ID> — Quitar un auto\n"
     "/msg <ID|@usr> <mensaje> — Escribirle a un cliente por el bot\n"
+    "/addmxn <monto> <ID|@usr> — Dar saldo en pesos\n"
+    "/quitarmxn <monto> <ID|@usr> — Quitar saldo en pesos\n"
     "/restaurar — Restaurar un backup (.db) tras perder datos\n"
     "/admin — Abrir este panel"
 )
@@ -2288,6 +2333,7 @@ PANTALLAS_NAV = {
     "likes", "craft", "cuenta", "autos", "craft_seg", "top", "top_mes", "comprar", "precios", "ayuda",
     "revendedor", "mov", "ref", "status", "craft_pedidos", "compras",
     "likes_enviar", "prueba", "jugador", "craft_comprar", "canjear", "auto_nuevo", "cs_otra", "soporte",
+    "recargar", "rc_otra", "mov_mxn",
 }
 
 
@@ -2366,13 +2412,16 @@ def texto_mis_compras(uid):
     if not rows:
         return "📭 Aún no tienes compras.\n\nElige un paquete en 🛒 Comprar likes."
     est = {"pendiente": "🕓 esperando comprobante", "en_revision": "🔎 en revisión", "aprobada": "✅ acreditada",
-           "rechazada": "❌ rechazada", "por_entregar": "📦 enviando", "entregada": "✅ entregada"}
+           "rechazada": "❌ rechazada", "por_entregar": "📦 enviando", "entregada": "✅ entregada",
+           "devuelta": "↩️ devuelta"}
     lineas = []
     for o in rows:
-        if o["producto"] == "craft":
+        if o["producto"] == "saldo":
+            que = "💵 Recarga de saldo"
+        elif o["producto"] == "craft":
             que = f"🎨 Nick Color • ID {o['player_id']}"
         elif o["producto"] == "craft_avulso":
-            que = f"👥 +{o['likes']:,} seguidores • ID {o['player_id']}"
+            que = f"👥 +{o['likes']:,} seguidores • ID {o['player_id']}" + (" (saldo)" if o["metodo"] == "saldo" else "")
         else:
             que = f"❤️ {o['likes']:,} likes"
         lineas.append(f"#{o['id']} • {que} • ${_fmt(o['monto'])} MXN • {est.get(o['estado'], o['estado'])}")
@@ -2467,6 +2516,46 @@ async def _manejar(ctx, q):
         except Exception:
             await say(ctx, chat_id, "⚠️ Marcada como entregada, pero no pude avisarle al cliente.")
         return await editar(q, f"✅ Orden #{oid} marcada como entregada y avisada al cliente.")
+
+    # ----- Saldo MXN: recarga rápida -----
+    if partes[0] == "rc" and len(partes) == 2 and partes[1].isdigit():
+        monto = int(partes[1])
+        if not SALDO_MIN <= monto <= SALDO_MAX:
+            return
+        await _quitar(q.message)
+        return await iniciar_recarga(ctx, uid, chat_id, monto)
+
+    # ----- Pagar Craftland con el saldo MXN -----
+    if partes[0] == "cw":
+        if len(partes) == 3 and partes[1] == "p" and partes[2].isdigit():
+            await _quitar(q.message)
+            return await craft_pagar_pack_saldo(ctx, uid, chat_id, partes[2])
+        if len(partes) == 4 and partes[1] == "s" and partes[2].isdigit() and partes[3].isdigit():
+            await _quitar(q.message)
+            return await craft_pagar_seg_saldo(ctx, uid, chat_id, partes[2], int(partes[3]))
+        return
+
+    # ----- Admin: devolver el saldo de un pedido que no se pudo entregar -----
+    if partes[0] == "dev" and len(partes) == 2 and partes[1].isdigit():
+        if uid not in ADMINS:
+            return
+        oid = int(partes[1])
+        o = db.execute("SELECT * FROM ordenes WHERE id=?", (oid,)).fetchone()
+        cur = db.execute(
+            "UPDATE ordenes SET estado='devuelta' WHERE id=? AND estado='por_entregar' AND metodo='saldo'", (oid,))
+        db.commit()
+        if not o or cur.rowcount != 1:
+            return await say(ctx, chat_id, "⚠️ Esa orden ya no se puede devolver (ya se entregó o no se pagó con saldo).")
+        c = int(round((o["monto"] or 0) * 100))
+        devolver_mxn(o["user_id"], c, f"orden #{oid} devuelta")
+        try:
+            await ctx.bot.send_message(
+                o["user_id"],
+                f"↩️ Tu pedido de +{o['likes']:,} seguidores (ID {o['player_id']}) no se pudo entregar.\n"
+                f"💵 Te devolvimos {fmt_mxn(c)} a tu saldo (saldo: {fmt_mxn(saldo_mxn(o['user_id']))}).")
+        except Exception:
+            pass
+        return await editar(q, f"↩️ Orden #{oid}: se devolvieron {fmt_mxn(c)} al saldo del cliente.")
 
     # ----- Craftland: continuar -----
     if partes[0] == "ct":
@@ -2600,10 +2689,12 @@ async def _manejar(ctx, q):
             f"▫️ Precio: ${CRAFT_PRECIO_MXN} MXN\n"
             f"▫️ Seguidores por cantidad: desde ${PRECIOS_SEGUIDORES[SEG_MIN]} MXN\n"
             "▫️ Pago: transferencia bancaria\n"
-            f"▫️ Estado: {estado}\n\nElige una opción 👇",
+            f"▫️ Estado: {estado}\n"
+            f"💵 Tu saldo MXN: {fmt_mxn(saldo_mxn(uid))}\n\nElige una opción 👇",
             InlineKeyboardMarkup([
                 [B(f"🎨 Comprar ahora • ${CRAFT_PRECIO_MXN} MXN", callback_data="m|craft_comprar")],
                 [B("👥 Seguidores por cantidad", callback_data="m|craft_seg")],
+                [B("💵 Recargar saldo MXN", callback_data="m|recargar")],
                 [B("📦 Mis pedidos", callback_data="m|craft_pedidos")],
                 volver]))
 
@@ -2611,12 +2702,38 @@ async def _manejar(ctx, q):
         return await editar(
             q,
             "╔══════════════╗\n  💳 𝗠𝗜 𝗖𝗨𝗘𝗡𝗧𝗔\n╚══════════════╝\n\n"
-            f"💳 Créditos: {_creditos_txt(uid)}  (1 crédito = 1 like)",
+            f"💳 Créditos: {_creditos_txt(uid)}  (1 crédito = 1 like)\n"
+            f"💵 Saldo MXN: {fmt_mxn(saldo_mxn(uid))}",
             InlineKeyboardMarkup([
                 [B("📜 Movimientos", callback_data="m|mov"), B("👥 Invitar amigos", callback_data="m|ref")],
                 [B("🎟 Canjear código", callback_data="m|canjear"), B("📊 Mi estado", callback_data="m|status")],
+                [B("💵 Recargar saldo MXN", callback_data="m|recargar"), B("📒 Mov. de saldo MXN", callback_data="m|mov_mxn")],
                 [B("🧾 Mis compras", callback_data="m|compras"), B("🛒 Comprar likes", callback_data="m|comprar")],
                 volver]))
+
+    if accion == "recargar":
+        filas, fila = [], []
+        for a in RECARGAS_RAPIDAS:
+            fila.append(B(f"${a:,}", callback_data=f"rc|{a}"))
+            if len(fila) == 3:
+                filas.append(fila)
+                fila = []
+        if fila:
+            filas.append(fila)
+        filas.append([B("✏️ Otra cantidad", callback_data="m|rc_otra")])
+        return await editar(
+            q,
+            "╔══════════════╗\n  💵 𝗦𝗔𝗟𝗗𝗢 𝗘𝗡 𝗣𝗘𝗦𝗢𝗦\n╚══════════════╝\n\n"
+            f"💵 Tu saldo: {fmt_mxn(saldo_mxn(uid))}\n\n"
+            "▫️ Deja saldo y paga Craftland (Nick Color y seguidores) al instante, sin hacer una transferencia cada vez\n"
+            "▫️ Si un pedido falla, el saldo se te devuelve\n"
+            f"▫️ Recarga mínima: ${SALDO_MIN}\n"
+            "🏦 Se recarga por transferencia bancaria\n\nElige cuánto recargar 👇",
+            InlineKeyboardMarkup(filas))
+
+    if accion == "mov_mxn":
+        return await editar(q, texto_mov_mxn(uid),
+                            InlineKeyboardMarkup([[B("💵 Recargar saldo", callback_data="m|recargar")]]))
 
     if accion == "likes_otra":
         if not ctx.user_data.get("likes_id"):
@@ -2744,6 +2861,19 @@ async def texto_libre(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Restaurar backup: se espera un archivo, no texto
     if tipo == "restaurar":
         return await m.reply_text("📎 Envía el archivo .db como documento (no texto). Para cancelar usa /start.")
+
+    # Saldo MXN: cantidad personalizada de recarga
+    if tipo == "rc_cant":
+        ctx.user_data.pop("esperando", None)
+        limpio = txt.replace("$", "").replace(",", "").replace(" ", "")
+        monto = int(limpio) if limpio.isdigit() else 0
+        if not SALDO_MIN <= monto <= SALDO_MAX:
+            ctx.user_data["esperando"] = ("rc_cant", time.time())
+            await _borrar_msg(m)
+            return await m.reply_text(
+                f"❌ La recarga debe ser de ${SALDO_MIN} a ${SALDO_MAX:,}, en pesos enteros. Ejemplo: 250")
+        await _limpiar_entrada(ctx, m)
+        return await iniciar_recarga(ctx, uid, update.effective_chat.id, monto)
 
     # Likes: cantidad personalizada
     if tipo == "likes_cant":
@@ -2990,7 +3120,7 @@ async def pedir_id_seguidores(ctx, chat_id, n, q=None):
 
 
 async def craft_seg_preview(ctx, uid, chat_id, player_id, n):
-    """Verifica el ID con el proveedor y muestra cuántos seguidores tendría después del envío."""
+    """Verifica el ID, muestra el antes/después y deja elegir cómo pagar."""
     if not CRAFT_KEY:
         return await say(ctx, chat_id, "👥 Este servicio no está disponible por ahora.")
     if cfg("bot_on", "1") == "0" and uid not in ADMINS:
@@ -3024,10 +3154,15 @@ async def craft_seg_preview(ctx, uid, chat_id, player_id, n):
     if pick(d, "eligible") is False:
         aviso = ("\n⚠️ Este ID ya recibió el pack nivel 6. Confirmaremos con el proveedor que pueda "
                  "recibir esta cantidad; si no se puede, te devolvemos tu pago.\n")
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("💳 Continuar al pago", callback_data=f"cs|ok|{player_id}|{n}"),
-        InlineKeyboardButton("❌ Cancelar", callback_data="m|cancel"),
-    ]])
+    B = InlineKeyboardButton
+    saldo = saldo_mxn(uid)
+    filas = []
+    if saldo >= precio * 100:
+        filas.append([B(f"💵 Pagar con mi saldo ({fmt_mxn(saldo)})", callback_data=f"cw|s|{player_id}|{n}")])
+    filas.append([B("🏦 Pagar por transferencia", callback_data=f"cs|ok|{player_id}|{n}")])
+    if saldo < precio * 100:
+        filas.append([B("💵 Recargar saldo", callback_data="m|recargar")])
+    filas.append([B("❌ Cancelar", callback_data="m|cancel")])
     await say(
         ctx, chat_id,
         "👥 SEGUIDORES CRAFTLAND\n"
@@ -3039,9 +3174,10 @@ async def craft_seg_preview(ctx, uid, chat_id, player_id, n):
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"↬ Cantidad: +{n:,} seguidores\n"
         f"↬ Precio: ${precio} MXN\n"
+        f"↬ Tu saldo: {fmt_mxn(saldo)}\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{aviso}¿Es tu cuenta? Confirma para continuar.",
-        reply_markup=kb)
+        f"{aviso}¿Es tu cuenta? Elige cómo pagar.",
+        reply_markup=InlineKeyboardMarkup(filas))
 
 
 # ================== CANTIDADES DE LIKES ==================
@@ -3136,7 +3272,7 @@ def restaurar_desde(ruta):
         db.backup(copia)
         copia.close()
 
-        res = {"nuevos": 0, "actualizados": 0, "creditos": 0, "previa": previa}
+        res = {"nuevos": 0, "actualizados": 0, "creditos": 0, "mxn": 0, "previa": previa}
         cols_users = {r[1] for r in db.execute("PRAGMA table_info(users)")}
         ahora = now().isoformat(timespec="seconds")
         try:
@@ -3155,6 +3291,9 @@ def restaurar_desde(ruta):
                     if cred:
                         sets.append("credits=COALESCE(credits,0)+?")
                         vals.append(cred)
+                    if int(d.get("saldo_mxn_c") or 0):
+                        sets.append("saldo_mxn_c=COALESCE(saldo_mxn_c,0)+?")
+                        vals.append(int(d["saldo_mxn_c"]))
                     if d.get("ref_by") is not None and ex["ref_by"] is None:
                         sets.append("ref_by=?")
                         vals.append(d["ref_by"])
@@ -3177,6 +3316,17 @@ def restaurar_desde(ruta):
                         "INSERT INTO movimientos(ts,user_id,delta,tipo,nota,saldo) VALUES(?,?,?,?,?,?)",
                         (ahora, uid, cred, "ajuste", "restauración de backup", saldo))
                     res["creditos"] += cred
+            for r in src.execute("SELECT user_id, saldo_mxn_c FROM users").fetchall() \
+                    if "saldo_mxn_c" in {c[1] for c in src.execute("PRAGMA table_info(users)")} else []:
+                mxn_c = int(r["saldo_mxn_c"] or 0)
+                if mxn_c:
+                    saldo_c = db.execute("SELECT COALESCE(saldo_mxn_c,0) FROM users WHERE user_id=?",
+                                         (r["user_id"],)).fetchone()[0]
+                    db.execute(
+                        "INSERT INTO movimientos_mxn(ts,user_id,delta_c,tipo,nota,saldo_c) VALUES(?,?,?,?,?,?)",
+                        (ahora, r["user_id"], mxn_c, "ajuste", "restauración de backup", saldo_c))
+                    res["mxn"] += mxn_c
+            res["mov_mxn"] = _copiar(src, tablas, "movimientos_mxn")
             res["movimientos"] = _copiar(src, tablas, "movimientos")
             res["envios"] = _copiar(src, tablas, "logs")
             res["codigos"] = _copiar(src, tablas, "codigos", ignorar=True)
@@ -3220,6 +3370,7 @@ async def restaurar_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "✅ Backup restaurado\n\n"
             f"👥 Usuarios nuevos: {res['nuevos']} • ya existían: {res['actualizados']}\n"
             f"💳 Créditos sumados: {res['creditos']:,}\n"
+            f"💵 Saldo MXN sumado: {fmt_mxn(res['mxn'])}\n"
             f"📜 Movimientos: {res['movimientos']} • Envíos: {res['envios']} • Códigos: {res['codigos']} "
             f"• Pruebas: {res['pruebas']} • Autos: {res['autos']}\n\n"
             f"🗂️ Copia de la base anterior: {res['previa']}\n"
@@ -3236,6 +3387,201 @@ async def restaurar_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             pass
 
 
+# ================== SALDO EN PESOS (MXN) ==================
+ETIQ_MXN = {"recarga": "Recarga", "compra": "Compra", "devolucion": "Devolución", "ajuste": "Ajuste"}
+
+
+def fmt_mxn(c):
+    """Dinero guardado en centavos -> texto en pesos."""
+    c = int(c or 0)
+    return f"${c // 100:,}" if c % 100 == 0 else f"${c / 100:,.2f}"
+
+
+def saldo_mxn(uid):
+    r = get_user(uid)
+    return int(r["saldo_mxn_c"] or 0) if r else 0
+
+
+def mov_mxn(uid, delta_c, tipo, nota=""):
+    if not delta_c:
+        return
+    db.execute(
+        "INSERT INTO movimientos_mxn(ts,user_id,delta_c,tipo,nota,saldo_c) VALUES(?,?,?,?,?,?)",
+        (now().isoformat(timespec="seconds"), uid, delta_c, tipo, nota, saldo_mxn(uid)))
+    db.commit()
+
+
+def acreditar_mxn(uid, c, tipo="recarga", nota=""):
+    db.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (uid,))
+    db.execute("UPDATE users SET saldo_mxn_c=COALESCE(saldo_mxn_c,0)+? WHERE user_id=?", (c, uid))
+    db.commit()
+    mov_mxn(uid, c, tipo, nota)
+
+
+def cobrar_mxn(uid, c, nota="", tipo="compra"):
+    """Descuenta c centavos si alcanzan. Devuelve True/False."""
+    cur = db.execute(
+        "UPDATE users SET saldo_mxn_c=COALESCE(saldo_mxn_c,0)-? WHERE user_id=? AND COALESCE(saldo_mxn_c,0)>=?",
+        (c, uid, c))
+    db.commit()
+    if cur.rowcount == 1:
+        mov_mxn(uid, -c, tipo, nota)
+        return True
+    return False
+
+
+def devolver_mxn(uid, c, nota=""):
+    if c and c > 0:
+        db.execute("UPDATE users SET saldo_mxn_c=COALESCE(saldo_mxn_c,0)+? WHERE user_id=?", (c, uid))
+        db.commit()
+        mov_mxn(uid, c, "devolucion", nota)
+
+
+def total_saldo_mxn_c():
+    return int(db.execute("SELECT COALESCE(SUM(saldo_mxn_c),0) FROM users").fetchone()[0])
+
+
+def recargas_mxn_hoy():
+    return int(db.execute(
+        "SELECT COALESCE(SUM(delta_c),0) FROM movimientos_mxn WHERE tipo='recarga' AND ts LIKE ?",
+        (hoy() + "%",)).fetchone()[0])
+
+
+def texto_mov_mxn(uid):
+    rows = db.execute(
+        "SELECT * FROM movimientos_mxn WHERE user_id=? ORDER BY id DESC LIMIT 10", (uid,)).fetchall()
+    cab = "╔══════════════╗\n  📒 𝗠𝗢𝗩. 𝗗𝗘 𝗦𝗔𝗟𝗗𝗢 𝗠𝗫𝗡\n╚══════════════╝\n\n"
+    if not rows:
+        return cab + "📭 Aún no tienes movimientos de saldo.\n\n💵 Saldo: " + fmt_mxn(saldo_mxn(uid))
+    lineas = []
+    for r in rows:
+        signo = "➕" if r["delta_c"] > 0 else "➖"
+        lineas.append(f"{signo} {fmt_mxn(abs(r['delta_c']))} • {ETIQ_MXN.get(r['tipo'], r['tipo'])} • "
+                      f"{r['ts'][5:16].replace('T', ' ')} • saldo {fmt_mxn(r['saldo_c'])}")
+    return cab + "\n".join(lineas) + f"\n\n💵 Saldo actual: {fmt_mxn(saldo_mxn(uid))}"
+
+
+async def iniciar_recarga(ctx, uid, chat_id, monto):
+    oid, m = crear_orden(uid, 0, "saldo", None, float(monto))
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("↩️ Cambiar monto", callback_data="m|recargar")],
+        [InlineKeyboardButton("❌ Cancelar orden", callback_data=f"cx|{oid}")]])
+    await ctx.bot.send_message(chat_id, texto_pago(oid, 0, m, "saldo"), parse_mode="HTML", reply_markup=kb)
+
+
+async def craft_pagar_pack_saldo(ctx, uid, chat_id, player_id):
+    """Nick Color Craftland pagado con el saldo MXN: se cobra y el pedido se crea solo."""
+    B = InlineKeyboardButton
+    if not CRAFT_KEY:
+        return await say(ctx, chat_id, "🎨 Este servicio no está disponible por ahora.")
+    if cfg("bot_on", "1") == "0" and uid not in ADMINS:
+        return await say(ctx, chat_id, "🔴 El bot está apagado por el momento.\n\n" + BRAND)
+    if _pedido_activo(player_id):
+        return await say(ctx, chat_id, "⏳ Ese ID ya tiene un pedido en curso.")
+    c = CRAFT_PRECIO_MXN * 100
+    if not cobrar_mxn(uid, c, f"Nick Color ID {player_id}"):
+        return await say(
+            ctx, chat_id,
+            f"💵 Saldo insuficiente: tienes {fmt_mxn(saldo_mxn(uid))} y necesitas {fmt_mxn(c)}.",
+            reply_markup=InlineKeyboardMarkup([[B("💵 Recargar saldo", callback_data="m|recargar")]]))
+    ok, res = await craft_crear_en_proveedor(ctx.bot, uid, chat_id, player_id, pago_c=c)
+    if not ok:
+        devolver_mxn(uid, c, f"Craftland rechazado ID {player_id}")
+        return await say(ctx, chat_id,
+                         f"⚠️ {res}\n💵 No se cobró nada: tu saldo sigue en {fmt_mxn(saldo_mxn(uid))}.")
+    await say(
+        ctx, chat_id,
+        f"✅ ¡Pedido creado!\n\n🧾 #{res}\n🆔 {player_id}\n"
+        f"💵 Pagaste {fmt_mxn(c)} con tu saldo • te quedan {fmt_mxn(saldo_mxn(uid))}\n"
+        "⏳ Te aviso aquí en cuanto termine.",
+        reply_markup=InlineKeyboardMarkup([[B("🏠 Menú", callback_data="m|menu_nuevo")]]))
+
+
+async def craft_pagar_seg_saldo(ctx, uid, chat_id, player_id, n):
+    """Seguidores por cantidad pagados con el saldo MXN (la entrega la haces tú desde el panel)."""
+    B = InlineKeyboardButton
+    precio = precio_seguidores(n)
+    if precio is None:
+        return await say(ctx, chat_id, "❌ Cantidad no válida.")
+    if cfg("bot_on", "1") == "0" and uid not in ADMINS:
+        return await say(ctx, chat_id, "🔴 El bot está apagado por el momento.\n\n" + BRAND)
+    c = precio * 100
+    if not cobrar_mxn(uid, c, f"+{n:,} seguidores ID {player_id}"):
+        return await say(
+            ctx, chat_id,
+            f"💵 Saldo insuficiente: tienes {fmt_mxn(saldo_mxn(uid))} y necesitas {fmt_mxn(c)}.",
+            reply_markup=InlineKeyboardMarkup([[B("💵 Recargar saldo", callback_data="m|recargar")]]))
+    cur = db.execute(
+        "INSERT INTO ordenes(ts, user_id, likes, monto, estado, producto, player_id, metodo) "
+        "VALUES(?,?,?,?, 'por_entregar', 'craft_avulso', ?, 'saldo')",
+        (now().isoformat(timespec="seconds"), uid, n, float(precio), player_id))
+    db.commit()
+    oid = cur.lastrowid
+    await say(
+        ctx, chat_id,
+        f"✅ ¡Pedido recibido!\n\n👥 +{n:,} seguidores Craftland\n🆔 {player_id}\n🧾 Orden #{oid}\n"
+        f"💵 Pagaste {fmt_mxn(c)} con tu saldo • te quedan {fmt_mxn(saldo_mxn(uid))}\n"
+        "⏳ Te aviso aquí cuando esté entregado.",
+        reply_markup=InlineKeyboardMarkup([[B("🏠 Menú", callback_data="m|menu_nuevo")]]))
+    for adm in ADMINS:
+        try:
+            await ctx.bot.send_message(
+                adm,
+                f"📦 ENTREGA PENDIENTE • ORDEN #{oid} (pagada con saldo MXN)\n\n"
+                f"👥 +{n:,} seguidores Craftland\n🆔 Player ID: {player_id}\n"
+                f"💵 Pagado: {fmt_mxn(c)} MXN\n\n"
+                "Envíalo desde el panel del proveedor (Envío avulso) y toca ✅ Marcar entregado.\n"
+                "Si no se puede entregar, toca ↩️ Devolver saldo.",
+                reply_markup=InlineKeyboardMarkup([[
+                    B("✅ Marcar entregado", callback_data=f"ent|{oid}"),
+                    B("↩️ Devolver saldo", callback_data=f"dev|{oid}")]]))
+        except Exception:
+            logging.exception("aviso entrega pendiente")
+
+
+def _parse_monto(txt):
+    try:
+        v = round(float(str(txt).replace("$", "").replace(",", "")), 2)
+    except ValueError:
+        return None
+    return int(round(v * 100)) if v > 0 else None
+
+
+@admin
+async def addmxn_cmd(update, ctx):
+    a = ctx.args
+    c = _parse_monto(a[0]) if len(a) == 2 else None
+    if c is None:
+        return await update.message.reply_text("❌ Uso: /addmxn <monto en pesos> <ID|@usuario>\nEjemplo: /addmxn 300 123456789")
+    uid = resolver(a[1])
+    if uid is None:
+        return await update.message.reply_text("❌ No conozco a ese usuario. Debe escribirle /start al bot, o usa su ID numérico.")
+    acreditar_mxn(uid, c, "recarga", "admin")
+    await update.message.reply_text(f"✅ +{fmt_mxn(c)} MXN a {a[1]}\n💵 Saldo MXN: {fmt_mxn(saldo_mxn(uid))}")
+    try:
+        await ctx.bot.send_message(
+            uid, f"🎉 Se acreditaron {fmt_mxn(c)} MXN a tu saldo\n💵 Saldo: {fmt_mxn(saldo_mxn(uid))}\n\n"
+                 f"Ya puedes pagar en 🎨 Nick Color Craftland con tu saldo.\n\n{BRAND}")
+    except Exception:
+        pass
+
+
+@admin
+async def quitarmxn_cmd(update, ctx):
+    a = ctx.args
+    c = _parse_monto(a[0]) if len(a) == 2 else None
+    if c is None:
+        return await update.message.reply_text("❌ Uso: /quitarmxn <monto en pesos> <ID|@usuario>")
+    uid = resolver(a[1])
+    if uid is None or get_user(uid) is None:
+        return await update.message.reply_text("❌ Usuario no encontrado.")
+    antes = saldo_mxn(uid)
+    db.execute("UPDATE users SET saldo_mxn_c=MAX(0, COALESCE(saldo_mxn_c,0)-?) WHERE user_id=?", (c, uid))
+    db.commit()
+    mov_mxn(uid, saldo_mxn(uid) - antes, "ajuste", "admin")
+    await update.message.reply_text(f"➖ -{fmt_mxn(c)} MXN a {a[1]}\n💵 Saldo MXN: {fmt_mxn(saldo_mxn(uid))}")
+
+
 def main():
     asyncio.set_event_loop(asyncio.new_event_loop())  # compatibilidad Python 3.14
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).concurrent_updates(True).build()
@@ -3248,12 +3594,12 @@ def main():
         "add": add_cmd, "quitar": quitar_cmd, "ban": ban_cmd, "unban": unban_cmd,
         "codigo": codigo_cmd, "broadcast": broadcast, "buscar": buscar,
         "aprobar": aprobar_cmd, "rechazar": rechazar_cmd, "resetprueba": resetprueba_cmd,
-        "autoday": autoday, "autoremove": autoremove, "msg": msg_cmd, "restaurar": restaurar_cmd,
+        "autoday": autoday, "autoremove": autoremove, "msg": msg_cmd, "restaurar": restaurar_cmd, "addmxn": addmxn_cmd, "quitarmxn": quitarmxn_cmd,
     }
     for nombre, fn in handlers.items():
         app.add_handler(CommandHandler(nombre, fn))
 
-    app.add_handler(CallbackQueryHandler(menu_cb, pattern=r"^(m|lk|ct|au|ad|rp|cs|ent)\|"))
+    app.add_handler(CallbackQueryHandler(menu_cb, pattern=r"^(m|lk|ct|au|ad|rp|cs|ent|rc|cw|dev)\|"))
     app.add_handler(CallbackQueryHandler(botones))
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, texto_libre))
