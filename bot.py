@@ -42,6 +42,7 @@ BACKUP_HORAS = float(os.environ.get("BACKUP_HORAS", "6"))   # cada cuántas hora
 
 PHONE = "+57 318 0051415"
 OWNER = PHONE  # solo se muestra el número de contacto
+WA_LINK = "https://wa.me/" + "".join(ch for ch in PHONE if ch.isdigit())   # abre el chat de WhatsApp
 CONTACTO = "+57ㅤ31800ㅤ51415"   # formato de la plantilla de likes enviados
 CANAL_ID = int(os.environ.get("CANAL_ID", "-1004299785475"))  # canal de referencias
 PRUEBA_LIKES = 100        # likes de la prueba gratuita (una vez por usuario y por ID de Free Fire)
@@ -385,9 +386,8 @@ async def enviar_referencia(bot, texto):
 SIN_ACCESO = (
     "🚫 No tienes likes disponibles.\n\n"
     "🎁 ¿Primera vez? Toca «Prueba gratis» en el menú (/start).\n"
-    "🛒 O compra en «Comprar likes».\n"
-    f"💰 2,000 likes ➜ ${PRECIOS_LIKES[2000][0]} USD / ${PRECIOS_LIKES[2000][1]} MXN\n"
-    f"📲 Soporte: {PHONE}\n\n{BRAND}"
+    "💬 Para precios y compra de likes escríbenos por WhatsApp:\n"
+    f"📲 {PHONE}\n\n{BRAND}"
 )
 
 
@@ -469,7 +469,7 @@ async def ayuda(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "╔══════════════╗\n  ❓ 𝗔𝗬𝗨𝗗𝗔\n╚══════════════╝\n\n"
         "❤️ 𝗟𝗜𝗞𝗘𝗦\n"
-        "1️⃣ Compra un paquete en 🛒 Comprar likes (transferencia bancaria)\n"
+        f"1️⃣ Pregunta precios y compra tus likes por WhatsApp ({PHONE})\n"
         "2️⃣ Tus likes se guardan en tu cuenta como créditos: 1 crédito = 1 like\n"
         "3️⃣ Entra a ❤️ Likes Free Fire → Enviar likes, escribe el ID y elige la cantidad\n\n"
         "🎨 𝗡𝗜𝗖𝗞 𝗖𝗢𝗟𝗢𝗥 𝗖𝗥𝗔𝗙𝗧𝗟𝗔𝗡𝗗\n"
@@ -1235,28 +1235,17 @@ async def iniciar_compra(ctx, uid, chat_id, likes):
 
 
 async def comprar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private":
-        return await update.message.reply_text(
-            "🔒 Usa este menú en privado conmigo para ver los datos de pago.")
     B = InlineKeyboardButton
-    filas, fila = [], []
-    for n in PAQUETES:
-        fila.append(B(f"{n:,} • ${PRECIOS_LIKES[n][1]:,}", callback_data=f"pk|{n}"))
-        if len(fila) == 2:
-            filas.append(fila)
-            fila = []
-    if fila:
-        filas.append(fila)
-    filas.append([B("💎 Pedido grande / 🤝 Revendedores", callback_data="m|revendedor")])
-    filas.append([B("⬅️ Menú", callback_data="m|menu")])
     await update.message.reply_text(
         "╔══════════════╗\n  🛒 𝗖𝗢𝗠𝗣𝗥𝗔𝗥 𝗟𝗜𝗞𝗘𝗦\n╚══════════════╝\n\n"
-        "▫️ Elige tu paquete (precio en MXN)\n"
-        "▫️ 1 like comprado = 1 crédito\n"
-        "🏦 Pago: Transferencia Bancaria México\n\n"
-        f"💎 Desde {PEDIDO_GRANDE:,} likes: pregunta por precio especial.\n\n"
-        "Toca un paquete 👇",
-        reply_markup=InlineKeyboardMarkup(filas))
+        "💬 Para conocer los precios y comprar likes escríbenos por WhatsApp.\n\n"
+        f"📲 {PHONE}\n\n"
+        "Cuando pagues, tus likes se acreditan en tu cuenta (1 crédito = 1 like) "
+        "y los envías desde ❤️ Likes Free Fire.\n"
+        f"💎 Pedidos de {PEDIDO_GRANDE:,} likes en adelante: precio especial.",
+        reply_markup=InlineKeyboardMarkup([
+            [B("💬 Escribir por WhatsApp", url=WA_LINK)],
+            [B("🎁 Probar gratis", callback_data="m|prueba")]]))
 
 
 async def recibir_comprobante(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1476,20 +1465,17 @@ def _fmt(x):
 
 
 async def precios(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    lineas = [f"❤️ {n:,} Likes — ${usd:,} USD / ${mxn:,} MXN" for n, (usd, mxn) in PRECIOS_LIKES.items()]
     B = InlineKeyboardButton
     await update.message.reply_text(
-        "❤️ PRECIOS DE LIKES FREE FIRE — CIBERSTORE\n\n" + "\n".join(lineas) + "\n\n"
+        "╔══════════════╗\n  💰 𝗣𝗥𝗘𝗖𝗜𝗢𝗦 𝗘 𝗜𝗡𝗙𝗢\n╚══════════════╝\n\n"
+        "❤️ Likes Free Fire: para conocer los precios escríbenos por WhatsApp.\n\n"
         f"🎨 Nick Color Craftland — ${CRAFT_PRECIO_MXN} MXN\n"
         f"👥 Seguidores Craftland — desde ${PRECIOS_SEGUIDORES[SEG_MIN]} MXN ({SEG_MIN:,})\n\n"
-        f"💎 Pedidos de {PEDIDO_GRANDE:,} likes en adelante: ¡mejoramos el precio!\n"
-        "🤝 Se buscan revendedores de likes.\n\n"
         "🏦 Pago por transferencia bancaria México (MXN)\n"
-        f"📲 Soporte: {PHONE}\n\n{BRAND}",
+        f"📲 WhatsApp: {PHONE}\n\n{BRAND}",
         reply_markup=InlineKeyboardMarkup([
-            [B("🛒 Comprar likes", callback_data="m|comprar"), B("🎨 Nick Color", callback_data="m|craft")],
-            [B("💎 Pedido grande / 🤝 Revendedores", callback_data="m|revendedor")],
-            [B("⬅️ Menú", callback_data="m|menu")]]))
+            [B("💬 Escribir por WhatsApp", url=WA_LINK)],
+            [B("🎨 Nick Color Craftland", callback_data="m|craft")]]))
 
 
 async def canjear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1580,8 +1566,8 @@ async def prueba_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if r and r["prueba_usada"]:
             return await update.message.reply_text(
                 "🎁 Ya usaste tu prueba gratuita.\n\n"
-                f"💰 2,000 likes ➜ ${PRECIOS_LIKES[2000][0]} USD / ${PRECIOS_LIKES[2000][1]} MXN\n"
-                f"🛒 Compra likes desde /start → 🛒 Comprar likes\n📲 Soporte: {PHONE}\n\n{BRAND}")
+                "💬 Para precios y compra de likes escríbenos por WhatsApp:\n"
+                f"📲 {PHONE}\n\n{BRAND}")
         if db.execute("SELECT 1 FROM pruebas WHERE target_id=?", (target_id,)).fetchone():
             return await update.message.reply_text(
                 "⚠️ Ese ID de Free Fire ya recibió una prueba gratuita.")
@@ -2078,9 +2064,8 @@ def kb_menu_principal(uid=None):
     filas = [
         [B("❤️ Likes Free Fire", callback_data="m|likes")],
         [B("🎨 Nick Color Craftland", callback_data="m|craft")],
-        [B("🛒 Comprar likes", callback_data="m|comprar"), B("💰 Precios", callback_data="m|precios")],
+        [B("🛒 Comprar likes", callback_data="m|comprar"), B("🏆 Top clientes", callback_data="m|top")],
         [B("💳 Mi cuenta", callback_data="m|cuenta"), B("🎁 Prueba gratis", callback_data="m|prueba")],
-        [B("🏆 Top clientes", callback_data="m|top")],
         [B("🆘 Ayuda y soporte", callback_data="m|ayuda"), B("🤝 Revendedores", callback_data="m|revendedor")],
     ]
     if uid in ADMINS:
@@ -2789,7 +2774,7 @@ async def _manejar(ctx, q):
             InlineKeyboardMarkup([
                 [B("📩 Quiero ser revendedor / pedido grande", callback_data="m|rev_solicitar")],
                 [B("💬 Escribir a soporte", callback_data="m|soporte")],
-                [B("💰 Ver precios", callback_data="m|precios")],
+                [B("💬 Escribir por WhatsApp", url=WA_LINK)],
                 volver]))
 
     if accion == "rev_solicitar":
